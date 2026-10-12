@@ -29,6 +29,7 @@ import {
 } from '@mui/material'
 import { alpha } from '@/utils/theme'
 import { CellTower, Visibility, VisibilityOff, ExpandMore, ExpandLess, Info } from '@mui/icons-material'
+import { useRevealAll } from '../../../contexts/revealSensitive'
 import { getSensitiveStyle, formatSignalValue, getSignalChipColor } from '../utils'
 import type { CellsResponse } from '@/api/types'
 
@@ -38,7 +39,9 @@ interface CellInfoProps {
 
 export function CellInfo({ cellsInfo }: CellInfoProps) {
   const [expanded, setExpanded] = useState(true)
-  const [showInfo, setShowInfo] = useState(false)
+  const [localShowInfo, setShowInfo] = useState(false)
+  const revealAll = useRevealAll()
+  const showInfo = localShowInfo || revealAll
 
   return (
     <Card>

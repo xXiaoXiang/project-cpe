@@ -11,6 +11,7 @@
 import { useState } from 'react'
 import { Box, Card, CardContent, Typography, Stack, Chip, IconButton, Tooltip } from '@mui/material'
 import { SimCard, Visibility, VisibilityOff, Phone, Sms, Language } from '@mui/icons-material'
+import { useRevealAll } from '../../../contexts/revealSensitive'
 import { getSensitiveStyle } from '../utils'
 import type { SimInfo } from '@/api/types'
 
@@ -19,7 +20,9 @@ interface SimCardInfoProps {
 }
 
 export function SimCardInfo({ simInfo }: SimCardInfoProps) {
-  const [showInfo, setShowInfo] = useState(false)
+  const [localShowInfo, setShowInfo] = useState(false)
+  const revealAll = useRevealAll()
+  const showInfo = localShowInfo || revealAll
 
   return (
     <Card sx={{ height: '100%' }}>

@@ -9,6 +9,7 @@
  * Copyright (c) 2025 by 1orz, All Rights Reserved. 
  */
 import { useEffect, useState } from 'react'
+import { useRevealAll } from '../contexts/revealSensitive'
 import {
   Box,
   Typography,
@@ -46,8 +47,11 @@ export default function DeviceInfoPage() {
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
   // 每个功能块独立的敏感信息显示状态
-  const [showDeviceId, setShowDeviceId] = useState(false)
-  const [showSimInfo, setShowSimInfo] = useState(false)
+  const revealAll = useRevealAll()
+  const [localShowDeviceId, setShowDeviceId] = useState(false)
+  const [localShowSimInfo, setShowSimInfo] = useState(false)
+  const showDeviceId = localShowDeviceId || revealAll
+  const showSimInfo = localShowSimInfo || revealAll
   
   // 设备信息（包含 online, powered, manufacturer, model）
   const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null)

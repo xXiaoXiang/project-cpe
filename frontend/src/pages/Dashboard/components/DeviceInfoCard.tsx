@@ -11,6 +11,7 @@
 import { useState } from 'react'
 import { Box, Card, CardContent, Typography, IconButton, Tooltip } from '@mui/material'
 import { Router, Visibility, VisibilityOff } from '@mui/icons-material'
+import { useRevealAll } from '../../../contexts/revealSensitive'
 import { getSensitiveStyle } from '../utils'
 import type { DeviceInfo, SystemStatsResponse } from '@/api/types'
 
@@ -20,7 +21,9 @@ interface DeviceInfoCardProps {
 }
 
 export function DeviceInfoCard({ deviceInfo, systemStats }: DeviceInfoCardProps) {
-  const [showInfo, setShowInfo] = useState(false)
+  const [localShowInfo, setShowInfo] = useState(false)
+  const revealAll = useRevealAll()
+  const showInfo = localShowInfo || revealAll
 
   return (
     <Card>

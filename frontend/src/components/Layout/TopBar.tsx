@@ -38,7 +38,10 @@ import {
   Brightness4 as DarkModeIcon,
   Brightness7 as LightModeIcon,
   Speed as SpeedIcon,
+  Visibility as VisibilityIcon,
+  VisibilityOff as VisibilityOffIcon,
 } from '@mui/icons-material'
+import { toggleRevealAll, useRevealAll } from '../../contexts/revealSensitive'
 import { useTheme } from '../../contexts/ThemeContext'
 import { useRefreshInterval } from '../../contexts/RefreshContext'
 
@@ -57,6 +60,7 @@ export default function TopBar({
 }: TopBarProps) {
   const { mode, toggleTheme } = useTheme()
   const { triggerRefresh } = useRefreshInterval()
+  const revealAll = useRevealAll()
   const [anchorEl, setAnchorEl] = useState<null | HTMLElement>(null)
   const [refreshMenuAnchor, setRefreshMenuAnchor] = useState<null | HTMLElement>(null)
 
@@ -134,6 +138,14 @@ export default function TopBar({
 
         {/* 右侧按钮组 */}
         <Box sx={{ display: 'flex', alignItems: 'center', gap: { xs: 0.5, sm: 1 } }}>
+          <IconButton
+            color="inherit"
+            onClick={toggleRevealAll}
+            title={revealAll ? '隐藏所有敏感信息' : '显示所有敏感信息'}
+          >
+            {revealAll ? <VisibilityOffIcon /> : <VisibilityIcon />}
+          </IconButton>
+
           {/* 刷新按钮 - 始终显示 */}
           <IconButton
             color="inherit"

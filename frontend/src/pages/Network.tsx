@@ -71,6 +71,7 @@ import {
 import Grid from '@mui/material/Grid'
 import { api, type RadioMode, type BandLockStatus, type BandLockRequest } from '../api'
 import { useRefreshInterval } from '../contexts/RefreshContext'
+import { useRevealAll } from '../contexts/revealSensitive'
 import ErrorSnackbar from '../components/ErrorSnackbar'
 import type { CellsResponse, OperatorListResponse, CellLocationResponse, CellLockStatusResponse, NetworkInterfaceInfo, IpAddress, ApnContext } from '../api/types'
 
@@ -122,7 +123,9 @@ export default function NetworkPage() {
   // 网络接口状态
   const [interfaces, setInterfaces] = useState<NetworkInterfaceInfo[]>([])
   const [showDownInterfaces, setShowDownInterfaces] = useState(false)
-  const [showIpAddresses, setShowIpAddresses] = useState(false)
+  const [localShowIpAddresses, setShowIpAddresses] = useState(false)
+  const revealAll = useRevealAll()
+  const showIpAddresses = localShowIpAddresses || revealAll
   
   // 频段锁定状态
   const [currentRadioMode, setCurrentRadioMode] = useState<RadioMode>('auto')
