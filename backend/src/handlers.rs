@@ -63,7 +63,8 @@ fn lpac_command(args: &[String]) -> TokioCommand {
     command
         .args(args)
         .env("LPAC_APDU", apdu)
-        .env("LPAC_APDU_AT_DEVICE", at_device);
+        .env("LPAC_APDU_AT_DEVICE", at_device)
+        .kill_on_drop(true);
     command
 }
 
@@ -80,10 +81,13 @@ struct LpacPayload {
 }
 
 async fn run_lpac_json(args: &[String]) -> Result<Value, String> {
-    let output = lpac_command(args)
-        .output()
-        .await
-        .map_err(|error| format!("Failed to start lpac: {error}"))?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        lpac_command(args).output(),
+    )
+    .await
+    .map_err(|_| "lpac command timed out after 120 seconds".to_string())?
+    .map_err(|error| format!("Failed to start lpac: {error}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json_start = stdout
         .find('{')
@@ -111,6 +115,10 @@ fn euicc_error(status: StatusCode, message: impl Into<String>) -> Response {
         Json(ApiResponse::<Value>::error(message)),
     )
         .into_response()
+}
+
+fn euicc_failure(message: impl Into<String>) -> Response {
+    euicc_error(StatusCode::OK, message)
 }
 
 fn validate_euicc_identifier(iccid: &str) -> Result<(), String> {
@@ -159,17 +167,17 @@ pub async fn get_euicc_info(State(_conn): State<Arc<Connection>>) -> Response {
             Json(ApiResponse::success_with_message("eUICC ready", data)),
         )
             .into_response(),
-        Err(error) => euicc_error(StatusCode::BAD_GATEWAY, error),
+        Err(error) => euicc_failure(error),
     }
 }
 
-/// POST /api/euicc/profile/enable - 启用 Profile 并刷新 Modem SIM 状态
+/// POST /api/euicc/profile/enable - 启用 Profile，确认切换成功后返回最新 Profile 列表
 pub async fn enable_euicc_profile(
-    State(conn): State<Arc<Connection>>,
+    State(_conn): State<Arc<Connection>>,
     Json(request): Json<EuiccProfileRequest>,
 ) -> Response {
     if let Err(error) = validate_euicc_identifier(&request.iccid) {
-        return euicc_error(StatusCode::BAD_REQUEST, error);
+        return euicc_failure(error);
     }
 
     let args = vec![
@@ -178,26 +186,63 @@ pub async fn enable_euicc_profile(
         request.iccid.clone(),
         "1".to_string(),
     ];
-    let enable_result = crate::serial::with_serial(async { run_lpac_json(&args).await }).await;
-    if let Err(error) = enable_result {
-        return euicc_error(StatusCode::BAD_GATEWAY, error);
-    }
+    let result: Result<Vec<EuiccProfile>, String> = crate::serial::with_serial(async {
+        run_lpac_json(&args).await?;
 
-    if let Err(error) = crate::dbus::refresh_sim(&conn).await {
-        return euicc_error(
-            StatusCode::BAD_GATEWAY,
-            format!("Profile enabled, but SIM refresh failed: {error}"),
-        );
-    }
+        let list_args = vec!["profile".to_string(), "list".to_string()];
+        let mut last_error = String::new();
+        for _ in 0..4 {
+            // eUICC 切换后需要时间恢复响应，过早查询会失败或仍显示旧状态
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            match run_lpac_json(&list_args).await {
+                Ok(data) => match serde_json::from_value::<Vec<EuiccProfile>>(data) {
+                    Ok(profiles)
+                        if profiles.iter().any(|profile| {
+                            profile.iccid == request.iccid
+                                && profile.profile_state.eq_ignore_ascii_case("enabled")
+                        }) =>
+                    {
+                        return Ok(profiles);
+                    }
+                    Ok(_) => last_error = "Profile list does not show the target as enabled".to_string(),
+                    Err(error) => last_error = format!("Invalid lpac profile list: {error}"),
+                },
+                Err(error) => last_error = error,
+            }
+        }
+        Err(last_error)
+    })
+    .await;
 
-    (
-        StatusCode::OK,
-        Json(ApiResponse::success_with_message(
-            "Profile enabled and SIM refreshed",
-            json!({ "iccid": request.iccid }),
-        )),
+    match result {
+        Ok(profiles) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Profile enabled",
+                json!({ "iccid": request.iccid, "profiles": profiles }),
+            )),
+        )
+            .into_response(),
+        Err(error) => euicc_failure(error),
+    }
+}
+
+/// POST /api/euicc/refresh-sim - 手动触发 Modem 重新读取 SIM
+pub async fn refresh_euicc_sim(State(conn): State<Arc<Connection>>) -> Response {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        crate::dbus::refresh_sim(&conn),
     )
-        .into_response()
+    .await
+    {
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("SIM refreshed", json!({}))),
+        )
+            .into_response(),
+        Ok(Err(error)) => euicc_failure(format!("SIM refresh failed: {error}")),
+        Err(_) => euicc_failure("SIM refresh timed out"),
+    }
 }
 
 /// POST /api/euicc/profile/delete - 删除 Profile
@@ -206,7 +251,7 @@ pub async fn delete_euicc_profile(
     Json(request): Json<EuiccProfileRequest>,
 ) -> Response {
     if let Err(error) = validate_euicc_identifier(&request.iccid) {
-        return euicc_error(StatusCode::BAD_REQUEST, error);
+        return euicc_failure(error);
     }
 
     let args = vec![
@@ -224,7 +269,7 @@ pub async fn delete_euicc_profile(
             )),
         )
             .into_response(),
-        Err(error) => euicc_error(StatusCode::BAD_GATEWAY, error),
+        Err(error) => euicc_failure(error),
     }
 }
 

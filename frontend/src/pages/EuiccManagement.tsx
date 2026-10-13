@@ -26,6 +26,7 @@ import {
   PowerSettingsNew,
   Refresh,
   SimCardDownload,
+  Sync,
 } from '@mui/icons-material'
 import { api } from '@/api'
 import type { EuiccDownloadRequest, EuiccInfo, EuiccProfile } from '@/api/types'
@@ -54,6 +55,8 @@ export default function EuiccManagementPage() {
   const [loadError, setLoadError] = useState<string | null>(null)
   const [pendingAction, setPendingAction] = useState<ProfileAction | null>(null)
   const [actionBusy, setActionBusy] = useState(false)
+  const [refreshSimOpen, setRefreshSimOpen] = useState(false)
+  const [refreshSimBusy, setRefreshSimBusy] = useState(false)
   const [downloadOpen, setDownloadOpen] = useState(false)
   const [downloadRequest, setDownloadRequest] = useState(emptyDownloadRequest)
   const [downloadError, setDownloadError] = useState<string | null>(null)
@@ -93,24 +96,51 @@ export default function EuiccManagementPage() {
 
   const runProfileAction = async () => {
     if (!pendingAction) return
+    const action = pendingAction
     setActionBusy(true)
     try {
-      const response = pendingAction.type === 'enable'
-        ? await api.enableEuiccProfile(pendingAction.profile.iccid)
-        : await api.deleteEuiccProfile(pendingAction.profile.iccid)
-      if (response.status !== 'ok') {
-        throw new Error(response.message || 'Profile 操作失败')
+      if (action.type === 'enable') {
+        const response = await api.enableEuiccProfile(action.profile.iccid)
+        if (response.status !== 'ok' || !response.data) {
+          throw new Error(response.message || '未确认到目标 Profile 已启用')
+        }
+        const { profiles } = response.data
+        setEuicc((current) => (current ? { ...current, profiles } : current))
+        setNotice({ severity: 'success', text: 'Profile 已切换' })
+      } else {
+        const response = await api.deleteEuiccProfile(action.profile.iccid)
+        if (response.status !== 'ok') {
+          throw new Error(response.message || 'Profile 删除失败')
+        }
+        setNotice({ severity: 'success', text: 'Profile 已删除' })
+        await loadEuicc()
       }
-      setNotice({
-        severity: 'success',
-        text: pendingAction.type === 'enable' ? 'Profile 已启用，SIM 状态已刷新' : 'Profile 已删除',
-      })
       setPendingAction(null)
-      await loadEuicc()
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      setPendingAction(null)
+      setNotice({
+        severity: 'error',
+        text: action.type === 'enable' ? `Profile 切换失败：${reason}` : reason,
+      })
+    } finally {
+      setActionBusy(false)
+    }
+  }
+
+  const runRefreshSim = async () => {
+    setRefreshSimBusy(true)
+    try {
+      const response = await api.refreshEuiccSim()
+      if (response.status !== 'ok') {
+        throw new Error(response.message || '强制刷新失败')
+      }
+      setNotice({ severity: 'success', text: '已发送强制刷新 SIM 指令' })
+      setRefreshSimOpen(false)
     } catch (error) {
       setNotice({ severity: 'error', text: error instanceof Error ? error.message : String(error) })
     } finally {
-      setActionBusy(false)
+      setRefreshSimBusy(false)
     }
   }
 
@@ -184,6 +214,15 @@ export default function EuiccManagementPage() {
             </span>
           </Tooltip>
           <Button
+            variant="outlined"
+            color="warning"
+            startIcon={<Sync />}
+            onClick={() => setRefreshSimOpen(true)}
+            disabled={!euicc || loading}
+          >
+            强制刷新 eUICC SIM
+          </Button>
+          <Button
             variant="contained"
             startIcon={<Download />}
             onClick={() => {
@@ -198,7 +237,7 @@ export default function EuiccManagementPage() {
       </Stack>
 
       <Alert severity="warning" sx={{ mb: 2.5 }}>
-        启用 Profile 会刷新 SIM 状态，蜂窝网络可能短暂中断。删除 Profile 不可撤销。
+        切换 Profile 可能使蜂窝网络短暂中断。删除 Profile 不可撤销。
       </Alert>
 
       {euiccUnavailable && (
@@ -300,7 +339,7 @@ export default function EuiccManagementPage() {
               <>
                 {pendingAction.type === 'delete'
                   ? '此操作不可撤销，将删除：'
-                  : '将启用并刷新 SIM 状态：'}
+                  : '将启用：'}
                 <Box component="span" sx={{ display: 'block', mt: 1, fontWeight: 600, color: 'text.primary', overflowWrap: 'anywhere' }}>
                   {pendingAction.profile.profileNickname || pendingAction.profile.profileName || pendingAction.profile.iccid}
                   {' · '}{pendingAction.profile.iccid}
@@ -320,6 +359,27 @@ export default function EuiccManagementPage() {
             startIcon={actionBusy ? <CircularProgress size={16} color="inherit" /> : undefined}
           >
             {pendingAction?.type === 'delete' ? '删除' : '启用'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={refreshSimOpen} onClose={() => !refreshSimBusy && setRefreshSimOpen(false)}>
+        <DialogTitle>强制刷新 eUICC SIM</DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ whiteSpace: 'pre-line' }}>
+            {'切换Profile后请耐心等待30秒，强制刷新有可能造成eUICC失去响应。\n确认是否强制刷新？'}
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setRefreshSimOpen(false)} disabled={refreshSimBusy}>取消</Button>
+          <Button
+            onClick={() => void runRefreshSim()}
+            color="warning"
+            variant="contained"
+            disabled={refreshSimBusy}
+            startIcon={refreshSimBusy ? <CircularProgress size={16} color="inherit" /> : undefined}
+          >
+            强制刷新
           </Button>
         </DialogActions>
       </Dialog>

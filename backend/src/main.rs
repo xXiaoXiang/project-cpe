@@ -270,6 +270,7 @@ async fn main() -> Result<()> {
         .route("/api/euicc", get(get_euicc_info).options(options_handler))
         .route("/api/euicc/profile/enable", post(enable_euicc_profile).options(options_handler))
         .route("/api/euicc/profile/delete", post(delete_euicc_profile).options(options_handler))
+        .route("/api/euicc/refresh-sim", post(refresh_euicc_sim).options(options_handler))
         .route("/api/euicc/profile/download", post(download_euicc_profile).options(options_handler))
         // ========== 网络接口 ==========
         .route("/api/network", get(get_network_info).options(options_handler))

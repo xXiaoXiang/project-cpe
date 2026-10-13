@@ -13,6 +13,7 @@ import type {
   DeviceInfo,
   SimInfo,
   EuiccInfo,
+  EuiccProfile,
   EuiccDownloadRequest,
   NetworkInfo,
   CellsResponse,
@@ -128,7 +129,7 @@ class UDX710API {
   }
 
   async enableEuiccProfile(iccid: string) {
-    return request<ApiResponse<{ iccid: string }>>('/euicc/profile/enable', {
+    return request<ApiResponse<{ iccid: string; profiles: EuiccProfile[] }>>('/euicc/profile/enable', {
       method: 'POST',
       body: JSON.stringify({ iccid }),
     })
@@ -139,6 +140,10 @@ class UDX710API {
       method: 'POST',
       body: JSON.stringify({ iccid }),
     })
+  }
+
+  async refreshEuiccSim() {
+    return request<ApiResponse<Record<string, never>>>('/euicc/refresh-sim', { method: 'POST' })
   }
 
   async downloadEuiccProfile(
