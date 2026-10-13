@@ -1584,8 +1584,58 @@ fn parse_operator_info(path: String, props: HashMap<String, OwnedValue>) -> Oper
 /// 手动注册到指定运营商
 pub async fn register_operator_manual(conn: &Connection, mccmnc: &str) -> zbus::Result<()> {
     with_serial(async {
-        let proxy = Proxy::new(conn, "org.ofono", "/ril_0", "org.ofono.NetworkRegistration").await?;
-        proxy.call("RegisterManually", &(mccmnc, "")).await
+        let radio_proxy = RadioSettingsProxy::new(conn).await?;
+        let radio_props = radio_proxy.get_properties().await?;
+        let technology_preference = radio_props
+            .get("TechnologyPreference")
+            .and_then(|value| String::try_from(value.clone()).ok())
+            .ok_or_else(|| zbus::Error::Failure("Missing TechnologyPreference".to_string()))?;
+
+        let registration_proxy =
+            Proxy::new(conn, "org.ofono", "/ril_0", "org.ofono.NetworkRegistration").await?;
+
+        match RadioMode::from_ofono_value(&technology_preference) {
+            Some(RadioMode::Auto) => {
+                match registration_proxy
+                    .call(
+                        "RegisterManually",
+                        &(mccmnc, zbus::zvariant::Value::Str("NR".into())),
+                    )
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(nr_error) => {
+                        warn!("NR manual registration failed, retrying with LTE: {}", nr_error);
+                        registration_proxy
+                            .call(
+                                "RegisterManually",
+                                &(mccmnc, zbus::zvariant::Value::Str("LTE".into())),
+                            )
+                            .await
+                    }
+                }
+            }
+            Some(RadioMode::LteOnly) => {
+                registration_proxy
+                    .call(
+                        "RegisterManually",
+                        &(mccmnc, zbus::zvariant::Value::Str("LTE".into())),
+                    )
+                    .await
+            }
+            Some(RadioMode::NrOnly) => {
+                registration_proxy
+                    .call(
+                        "RegisterManually",
+                        &(mccmnc, zbus::zvariant::Value::Str("NR".into())),
+                    )
+                    .await
+            }
+            None => Err(zbus::Error::Failure(format!(
+                "Unsupported TechnologyPreference: {}",
+                technology_preference
+            ))),
+        }
     }).await
 }
 
