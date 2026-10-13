@@ -12,6 +12,8 @@ import type {
   ApiResponse,
   DeviceInfo,
   SimInfo,
+  EuiccInfo,
+  EuiccDownloadRequest,
   NetworkInfo,
   CellsResponse,
   QosInfo,
@@ -119,6 +121,84 @@ class UDX710API {
   // SIM 卡信息（ICCID、IMSI、手机号等）
   async getSimInfo() {
     return request<ApiResponse<SimInfo>>('/sim')
+  }
+
+  async getEuiccInfo() {
+    return request<ApiResponse<EuiccInfo>>('/euicc', { cache: 'no-store' })
+  }
+
+  async enableEuiccProfile(iccid: string) {
+    return request<ApiResponse<{ iccid: string }>>('/euicc/profile/enable', {
+      method: 'POST',
+      body: JSON.stringify({ iccid }),
+    })
+  }
+
+  async deleteEuiccProfile(iccid: string) {
+    return request<ApiResponse<{ iccid: string }>>('/euicc/profile/delete', {
+      method: 'POST',
+      body: JSON.stringify({ iccid }),
+    })
+  }
+
+  async downloadEuiccProfile(
+    payload: EuiccDownloadRequest,
+    onOutput: (text: string) => void
+  ): Promise<void> {
+    const response = await fetch(`${API_BASE}/euicc/profile/download`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+
+    if (!response.ok) {
+      let message = `HTTP error! status: ${response.status}`
+      try {
+        const body = await response.json() as ApiResponse<unknown>
+        message = body.message || message
+      } catch {
+        // Keep the HTTP status when the server did not return a JSON error.
+      }
+      throw new Error(message)
+    }
+
+    if (!response.body) throw new Error('Download stream is unavailable')
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let pending = ''
+    const completion: { value?: { success: boolean; message: string } } = {}
+
+    const consumeLine = (line: string) => {
+      if (!line.trim()) return
+      const event = JSON.parse(line) as {
+        type: string
+        text?: string
+        success?: boolean
+        message?: string
+      }
+      if (event.type === 'output' && event.text) onOutput(event.text)
+      if (event.type === 'complete') {
+        completion.value = {
+          success: event.success === true,
+          message: event.message || 'LPAC download failed',
+        }
+      }
+    }
+
+    while (true) {
+      const { value, done } = await reader.read()
+      pending += decoder.decode(value, { stream: !done })
+      const lines = pending.split('\n')
+      pending = lines.pop() || ''
+      lines.forEach(consumeLine)
+      if (done) break
+    }
+    consumeLine(pending)
+
+    const result = completion.value
+    if (!result) throw new Error('LPAC stream ended without a completion status')
+    if (!result.success) throw new Error(result.message)
   }
 
   // 网络信息

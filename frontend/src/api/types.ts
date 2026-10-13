@@ -38,6 +38,32 @@ export interface SimInfo {
   preferred_languages: string[] // 首选语言列表
 }
 
+export interface EuiccProfile {
+  iccid: string
+  isdpAid: string
+  profileState: string
+  profileNickname: string | null
+  serviceProviderName: string | null
+  profileName: string | null
+  iconType: unknown
+  icon: unknown
+  profileClass: string | null
+}
+
+export interface EuiccInfo {
+  eid: string
+  firmware_version: string | null
+  profiles: EuiccProfile[]
+}
+
+export interface EuiccDownloadRequest {
+  activation_code?: string
+  smdp_address?: string
+  matching_id?: string
+  confirmation_code?: string
+  imei?: string
+}
+
 // 网络信息
 export interface NetworkInfo {
   operator_name: string

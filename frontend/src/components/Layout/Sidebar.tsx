@@ -34,6 +34,7 @@ import {
   WebAsset as WebTerminalIcon,
   SystemUpdateAlt as OtaIcon,
   RocketLaunch as InitScriptIcon,
+  SimCardDownload as EuiccIcon,
 } from '@mui/icons-material'
 
 interface SidebarProps {
@@ -47,6 +48,7 @@ interface SidebarProps {
 const menuItems = [
   { path: '/', label: '仪表盘', icon: DashboardIcon },
   { path: '/device', label: '设备信息', icon: DevicesIcon },
+  { path: '/euicc', label: 'eUICC管理', icon: EuiccIcon },
   { path: '/network', label: '网络状态', icon: SignalIcon },
   { path: '/phone', label: '电话管理', icon: PhoneIcon },
   { path: '/sms', label: '短信管理', icon: SmsIcon },

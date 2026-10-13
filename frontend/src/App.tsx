@@ -19,6 +19,7 @@ import MainLayout from './components/Layout/MainLayout'
 // 路由级别代码分割 - 按需加载页面组件
 const Dashboard = lazy(() => import('./pages/Dashboard'))
 const DeviceInfo = lazy(() => import('./pages/DeviceInfo'))
+const EuiccManagement = lazy(() => import('./pages/EuiccManagement'))
 const Network = lazy(() => import('./pages/Network'))
 const Phone = lazy(() => import('./pages/Phone'))
 const SMS = lazy(() => import('./pages/SMS'))
@@ -48,6 +49,7 @@ interface AppRouteConfig {
 const appRoutes: AppRouteConfig[] = [
   { index: true, component: Dashboard },
   { path: 'device', component: DeviceInfo },
+  { path: 'euicc', component: EuiccManagement },
   { path: 'network', component: Network },
   { path: 'phone', component: Phone },
   { path: 'sms', component: SMS },

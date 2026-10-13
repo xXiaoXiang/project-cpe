@@ -267,6 +267,10 @@ async fn main() -> Result<()> {
         .route("/api/sim", get(get_sim_info).options(options_handler))
         .route("/api/sim/slot", get(get_sim_slot_handler).options(options_handler))
         .route("/api/sim/slot/switch", post(switch_sim_slot_handler).options(options_handler))
+        .route("/api/euicc", get(get_euicc_info).options(options_handler))
+        .route("/api/euicc/profile/enable", post(enable_euicc_profile).options(options_handler))
+        .route("/api/euicc/profile/delete", post(delete_euicc_profile).options(options_handler))
+        .route("/api/euicc/profile/download", post(download_euicc_profile).options(options_handler))
         // ========== 网络接口 ==========
         .route("/api/network", get(get_network_info).options(options_handler))
         .route("/api/network/interfaces", get(get_network_interfaces_info).options(options_handler))

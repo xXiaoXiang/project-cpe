@@ -219,6 +219,45 @@ pub struct SwitchSimSlotRequest {
     pub slot: u8,
 }
 
+/// eUICC 中已安装的 Profile
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct EuiccProfile {
+    pub iccid: String,
+    pub isdp_aid: String,
+    pub profile_state: String,
+    pub profile_nickname: Option<String>,
+    pub service_provider_name: Option<String>,
+    pub profile_name: Option<String>,
+    pub icon_type: Option<serde_json::Value>,
+    pub icon: Option<serde_json::Value>,
+    pub profile_class: Option<String>,
+}
+
+/// eUICC 信息与 Profile 列表
+#[derive(Debug, Serialize)]
+pub struct EuiccInfoResponse {
+    pub eid: String,
+    pub firmware_version: Option<String>,
+    pub profiles: Vec<EuiccProfile>,
+}
+
+/// Profile 操作请求
+#[derive(Debug, Deserialize)]
+pub struct EuiccProfileRequest {
+    pub iccid: String,
+}
+
+/// 下载 eUICC Profile 请求
+#[derive(Debug, Deserialize)]
+pub struct EuiccDownloadRequest {
+    pub activation_code: Option<String>,
+    pub smdp_address: Option<String>,
+    pub matching_id: Option<String>,
+    pub confirmation_code: Option<String>,
+    pub imei: Option<String>,
+}
+
 /// 网络信息响应
 #[derive(Debug, Serialize, Default)]
 pub struct NetworkInfoResponse {

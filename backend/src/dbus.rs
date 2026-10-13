@@ -65,6 +65,9 @@ pub trait ConnectionContext {
 pub trait SimManager {
     /// 获取SIM卡所有属性
     fn get_properties(&self) -> zbus::Result<HashMap<String, zbus::zvariant::OwnedValue>>;
+
+    /// 通知 Modem 重新读取 SIM 状态
+    fn sim_refresh(&self) -> zbus::Result<()>;
 }
 
 /// ofono MessageManager 代理接口
@@ -865,6 +868,15 @@ pub async fn get_sim_info_data(conn: &Connection) -> zbus::Result<SimInfoRespons
         pin_required,
         preferred_languages,
     })
+}
+
+/// 请求 Modem 刷新当前 SIM/eUICC 状态
+pub async fn refresh_sim(conn: &Connection) -> zbus::Result<()> {
+    with_serial(async {
+        let proxy = SimManagerProxy::new(conn).await?;
+        proxy.sim_refresh().await
+    })
+    .await
 }
 
 /// 获取网络信息

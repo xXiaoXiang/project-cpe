@@ -13,13 +13,20 @@
 //! 包含所有 HTTP API 的处理函数
 
 use axum::{
+    body::{Body, Bytes},
     extract::{Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode},
-    response::IntoResponse,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
-use serde_json::json;
-use std::sync::Arc;
+use futures_util::stream;
+use serde_json::{json, Value};
+use std::{convert::Infallible, process::Stdio, sync::Arc};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::Command as TokioCommand,
+    sync::mpsc,
+};
 use zbus::Connection;
 
 use crate::{
@@ -44,6 +51,312 @@ use crate::{
 };
 use crate::state::FrontendRuntime;
 use std::process::Command;
+
+fn lpac_command(args: &[String]) -> TokioCommand {
+    let path = std::env::var_os("LPAC_PATH")
+        .unwrap_or_else(|| "/home/root/lpac/lpac".into());
+    let apdu = std::env::var_os("LPAC_APDU").unwrap_or_else(|| "at".into());
+    let at_device = std::env::var_os("LPAC_APDU_AT_DEVICE")
+        .unwrap_or_else(|| "/dev/stty_lte30".into());
+
+    let mut command = TokioCommand::new(path);
+    command
+        .args(args)
+        .env("LPAC_APDU", apdu)
+        .env("LPAC_APDU_AT_DEVICE", at_device);
+    command
+}
+
+#[derive(serde::Deserialize)]
+struct LpacResponse {
+    payload: LpacPayload,
+}
+
+#[derive(serde::Deserialize)]
+struct LpacPayload {
+    code: i64,
+    message: String,
+    data: Value,
+}
+
+async fn run_lpac_json(args: &[String]) -> Result<Value, String> {
+    let output = lpac_command(args)
+        .output()
+        .await
+        .map_err(|error| format!("Failed to start lpac: {error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json_start = stdout
+        .find('{')
+        .ok_or_else(|| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            format!("lpac returned no JSON: {}{}", stdout, stderr)
+        })?;
+    let response: LpacResponse = serde_json::from_str(&stdout[json_start..])
+        .map_err(|error| format!("Invalid lpac response: {error}; output: {stdout}"))?;
+
+    if !output.status.success() || response.payload.code != 0 {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "lpac failed ({}): {}{}",
+            response.payload.code, response.payload.message, stderr
+        ));
+    }
+
+    Ok(response.payload.data)
+}
+
+fn euicc_error(status: StatusCode, message: impl Into<String>) -> Response {
+    (
+        status,
+        Json(ApiResponse::<Value>::error(message)),
+    )
+        .into_response()
+}
+
+fn validate_euicc_identifier(iccid: &str) -> Result<(), String> {
+    if iccid.is_empty()
+        || iccid.len() > 64
+        || !iccid.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return Err("Invalid ICCID/Profile identifier".to_string());
+    }
+    Ok(())
+}
+
+/// GET /api/euicc - 检查 eUICC 并列出已安装 Profile
+pub async fn get_euicc_info(State(_conn): State<Arc<Connection>>) -> Response {
+    let result = crate::serial::with_serial(async {
+        let chip_args = vec!["chip".to_string(), "info".to_string()];
+        let chip_info = run_lpac_json(&chip_args).await?;
+        let eid = chip_info
+            .get("eidValue")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "lpac chip info did not return an EID".to_string())?
+            .to_string();
+        let firmware_version = chip_info
+            .get("EUICCInfo2")
+            .and_then(|value| value.get("euiccFirmwareVer"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
+        let profile_args = vec!["profile".to_string(), "list".to_string()];
+        let profile_data = run_lpac_json(&profile_args).await?;
+        let profiles = serde_json::from_value(profile_data)
+            .map_err(|error| format!("Invalid lpac profile list: {error}"))?;
+
+        Ok::<_, String>(EuiccInfoResponse {
+            eid,
+            firmware_version,
+            profiles,
+        })
+    })
+    .await;
+
+    match result {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("eUICC ready", data)),
+        )
+            .into_response(),
+        Err(error) => euicc_error(StatusCode::BAD_GATEWAY, error),
+    }
+}
+
+/// POST /api/euicc/profile/enable - 启用 Profile 并刷新 Modem SIM 状态
+pub async fn enable_euicc_profile(
+    State(conn): State<Arc<Connection>>,
+    Json(request): Json<EuiccProfileRequest>,
+) -> Response {
+    if let Err(error) = validate_euicc_identifier(&request.iccid) {
+        return euicc_error(StatusCode::BAD_REQUEST, error);
+    }
+
+    let args = vec![
+        "profile".to_string(),
+        "enable".to_string(),
+        request.iccid.clone(),
+        "1".to_string(),
+    ];
+    let enable_result = crate::serial::with_serial(async { run_lpac_json(&args).await }).await;
+    if let Err(error) = enable_result {
+        return euicc_error(StatusCode::BAD_GATEWAY, error);
+    }
+
+    if let Err(error) = crate::dbus::refresh_sim(&conn).await {
+        return euicc_error(
+            StatusCode::BAD_GATEWAY,
+            format!("Profile enabled, but SIM refresh failed: {error}"),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Profile enabled and SIM refreshed",
+            json!({ "iccid": request.iccid }),
+        )),
+    )
+        .into_response()
+}
+
+/// POST /api/euicc/profile/delete - 删除 Profile
+pub async fn delete_euicc_profile(
+    State(_conn): State<Arc<Connection>>,
+    Json(request): Json<EuiccProfileRequest>,
+) -> Response {
+    if let Err(error) = validate_euicc_identifier(&request.iccid) {
+        return euicc_error(StatusCode::BAD_REQUEST, error);
+    }
+
+    let args = vec![
+        "profile".to_string(),
+        "delete".to_string(),
+        request.iccid.clone(),
+    ];
+    let result = crate::serial::with_serial(async { run_lpac_json(&args).await }).await;
+    match result {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Profile deleted",
+                json!({ "iccid": request.iccid }),
+            )),
+        )
+            .into_response(),
+        Err(error) => euicc_error(StatusCode::BAD_GATEWAY, error),
+    }
+}
+
+async fn forward_lpac_output<R>(mut reader: R, sender: mpsc::Sender<Bytes>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let mut buffer = [0_u8; 2048];
+    loop {
+        let read = match reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        let event = json!({
+            "type": "output",
+            "text": String::from_utf8_lossy(&buffer[..read]),
+        });
+        let mut line = event.to_string();
+        line.push('\n');
+        if sender.send(Bytes::from(line)).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// POST /api/euicc/profile/download - 下载 Profile 并流式返回 lpac 输出
+pub async fn download_euicc_profile(
+    Json(request): Json<EuiccDownloadRequest>,
+) -> Response {
+    let mut args = vec!["profile".to_string(), "download".to_string()];
+    let activation_code = request
+        .activation_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if let Some(activation_code) = activation_code {
+        args.extend(["-a".to_string(), activation_code.to_string()]);
+    } else {
+        let smdp_address = request
+            .smdp_address
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let matching_id = request
+            .matching_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let (Some(smdp_address), Some(matching_id)) = (smdp_address, matching_id) else {
+            return euicc_error(
+                StatusCode::BAD_REQUEST,
+                "Provide an activation code or both SM-DP+ address and matching ID",
+            );
+        };
+        args.extend([
+            "-s".to_string(),
+            smdp_address.to_string(),
+            "-m".to_string(),
+            matching_id.to_string(),
+        ]);
+    }
+
+    for (flag, value) in [("-c", request.confirmation_code), ("-i", request.imei)] {
+        if let Some(value) = value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            args.extend([flag.to_string(), value]);
+        }
+    }
+
+    let (sender, receiver) = mpsc::channel::<Bytes>(32);
+    tokio::spawn(async move {
+        crate::serial::with_serial(async move {
+            let spawn_result = lpac_command(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
+            let mut child = match spawn_result {
+                Ok(child) => child,
+                Err(error) => {
+                    let event = json!({ "type": "complete", "success": false, "message": format!("Failed to start lpac: {error}") });
+                    let mut line = event.to_string();
+                    line.push('\n');
+                    let _ = sender.send(Bytes::from(line)).await;
+                    return;
+                }
+            };
+
+            let stdout_task = tokio::spawn(forward_lpac_output(
+                child.stdout.take().expect("stdout is piped"),
+                sender.clone(),
+            ));
+            let stderr_task = tokio::spawn(forward_lpac_output(
+                child.stderr.take().expect("stderr is piped"),
+                sender.clone(),
+            ));
+            let status = child.wait().await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+
+            let (success, message) = match status {
+                Ok(status) if status.success() => (true, "LPAC download completed"),
+                Ok(_) => (false, "LPAC download failed"),
+                Err(_) => (false, "Failed to wait for LPAC download"),
+            };
+            let event = json!({ "type": "complete", "success": success, "message": message });
+            let mut line = event.to_string();
+            line.push('\n');
+            let _ = sender.send(Bytes::from(line)).await;
+        })
+        .await;
+    });
+
+    let body_stream = stream::unfold(receiver, |mut receiver| async move {
+        receiver
+            .recv()
+            .await
+            .map(|chunk| (Ok::<Bytes, Infallible>(chunk), receiver))
+    });
+    let mut response = Response::new(Body::from_stream(body_stream));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-transform"),
+    );
+    response
+}
 
 /// 处理 OPTIONS 请求（CORS 预检）
 pub async fn options_handler() -> impl IntoResponse {
