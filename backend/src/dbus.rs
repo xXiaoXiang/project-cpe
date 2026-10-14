@@ -879,6 +879,16 @@ pub async fn refresh_sim(conn: &Connection) -> zbus::Result<()> {
     .await
 }
 
+/// 读取当前注册网络的 MCC（不走全局锁）
+pub async fn get_registered_mcc(conn: &Connection) -> Option<String> {
+    let proxy = NetworkRegistrationProxy::new(conn).await.ok()?;
+    let props = proxy.get_properties().await.ok()?;
+    props
+        .get("MobileCountryCode")
+        .and_then(|value| String::try_from(value.clone()).ok())
+        .filter(|mcc| !mcc.is_empty())
+}
+
 /// 获取网络信息
 ///
 /// # Arguments

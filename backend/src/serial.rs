@@ -38,3 +38,14 @@ where
     f.await
 }
 
+/// LPAC 通过独立 AT 设备访问 eUICC，只需与自身串行，不占用 DBus 全局锁
+static EUICC_LOCK: Mutex<()> = Mutex::const_new(());
+
+pub async fn with_euicc_serial<T, F>(f: F) -> T
+where
+    F: Future<Output = T>,
+{
+    let _guard = EUICC_LOCK.lock().await;
+    f.await
+}
+

@@ -16,6 +16,7 @@ import {
   usePageVisibility,
 } from '@/hooks/useAdaptivePolling'
 import type {
+  ApiResponse,
   DeviceInfo,
   NetworkInfo,
   CellsResponse,
@@ -84,7 +85,8 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
 
   const [speedHistory, setSpeedHistory] = useState<Record<string, InterfaceSpeedHistory>>({})
   const speedHistoryRef = useRef<Record<string, InterfaceSpeedHistory>>({})
-  const requestIdRef = useRef(0)
+  const inFlightRef = useRef(new Set<string>())
+  const errorsRef = useRef(new Map<string, string>())
 
   const updateSpeedHistory = useCallback((stats: SystemStatsResponse | null) => {
     if (!stats?.network_speed?.interfaces) return
@@ -129,130 +131,52 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
     }
   )
 
-  const loadData = useCallback(async () => {
-    const requestId = requestIdRef.current + 1
-    requestIdRef.current = requestId
-    setError(null)
-
-    const extendedRequests = Promise.allSettled([api.getImsStatus(), api.getRoamingStatus()])
-
-    const baseResults = await Promise.allSettled([
-      api.getDeviceInfo(),
-      api.getSimInfo(),
-      api.getSystemStats(),
-      api.getNetworkInfo(),
-      api.getDataStatus(),
-      api.getCellsInfo(),
-      api.getQosInfo(),
-      api.getAirplaneMode(),
-    ])
-
-    if (requestId !== requestIdRef.current) {
-      return
-    }
-
-    const baseErrors: string[] = []
-
-    const deviceResult = baseResults[0]
-    if (deviceResult.status === 'fulfilled') {
-      if (deviceResult.value.data) setDeviceInfo(deviceResult.value.data)
-    } else {
-      baseErrors.push(formatRequestError('设备信息', deviceResult.reason))
-    }
-
-    const simResult = baseResults[1]
-    if (simResult.status === 'fulfilled') {
-      if (simResult.value.data) setSimInfo(simResult.value.data)
-    } else {
-      baseErrors.push(formatRequestError('SIM 信息', simResult.reason))
-    }
-
-    const statsResult = baseResults[2]
-    if (statsResult.status === 'fulfilled') {
-      if (statsResult.value.data) {
-        setSystemStats(statsResult.value.data)
-        updateSpeedHistory(statsResult.value.data)
+  // 每个接口独立更新；同一接口上一次请求未返回时跳过本轮，避免慢接口堆积请求
+  const fetchInto = useCallback(
+    async <T,>(
+      key: string,
+      label: string,
+      request: () => Promise<ApiResponse<T>>,
+      apply: (data: T) => void
+    ) => {
+      if (inFlightRef.current.has(key)) return
+      inFlightRef.current.add(key)
+      try {
+        const response = await request()
+        if (response.data) apply(response.data)
+        errorsRef.current.delete(key)
+      } catch (errorValue) {
+        errorsRef.current.set(key, formatRequestError(label, errorValue))
+      } finally {
+        inFlightRef.current.delete(key)
+        setInitialLoading(false)
+        setError(errorsRef.current.values().next().value ?? null)
       }
-    } else {
-      baseErrors.push(formatRequestError('系统状态', statsResult.reason))
-    }
+    },
+    [formatRequestError]
+  )
 
-    const networkResult = baseResults[3]
-    if (networkResult.status === 'fulfilled') {
-      if (networkResult.value.data) setNetworkInfo(networkResult.value.data)
-    } else {
-      baseErrors.push(formatRequestError('网络信息', networkResult.reason))
-    }
-
-    const dataStatusResult = baseResults[4]
-    if (dataStatusResult.status === 'fulfilled') {
-      if (dataStatusResult.value.data) setDataStatus(dataStatusResult.value.data.active)
-    } else {
-      baseErrors.push(formatRequestError('数据连接状态', dataStatusResult.reason))
-    }
-
-    const cellsResult = baseResults[5]
-    if (cellsResult.status === 'fulfilled') {
-      if (cellsResult.value.data) setCellsInfo(cellsResult.value.data)
-    } else {
-      baseErrors.push(formatRequestError('小区信息', cellsResult.reason))
-    }
-
-    const qosResult = baseResults[6]
-    if (qosResult.status === 'fulfilled') {
-      if (qosResult.value.data) setQosInfo(qosResult.value.data)
-    } else {
-      baseErrors.push(formatRequestError('QoS 信息', qosResult.reason))
-    }
-
-    const airplaneModeResult = baseResults[7]
-    if (airplaneModeResult.status === 'fulfilled') {
-      if (airplaneModeResult.value.data) setAirplaneMode(airplaneModeResult.value.data)
-    } else {
-      baseErrors.push(formatRequestError('飞行模式状态', airplaneModeResult.reason))
-    }
-
-    setInitialLoading(false)
-    if (baseErrors.length > 0) {
-      setError(baseErrors[0])
-    }
-
-    const extendedResults = await extendedRequests
-    if (requestId !== requestIdRef.current) {
-      return
-    }
-
-    const extendedErrors: string[] = []
-
-    const imsResult = extendedResults[0]
-    if (imsResult.status === 'fulfilled') {
-      if (imsResult.value.data) setImsStatus(imsResult.value.data)
-    } else {
-      extendedErrors.push(formatRequestError('IMS 状态', imsResult.reason))
-    }
-
-    const roamingResult = extendedResults[1]
-    if (roamingResult.status === 'fulfilled') {
-      if (roamingResult.value.data) setRoaming(roamingResult.value.data)
-    } else {
-      extendedErrors.push(formatRequestError('漫游状态', roamingResult.reason))
-    }
-
-    if (extendedErrors.length > 0 && baseErrors.length === 0) {
-      setError(extendedErrors[0])
-    }
-  }, [formatRequestError, updateSpeedHistory])
+  const loadData = useCallback(async () => {
+    await Promise.allSettled([
+      fetchInto('device', '设备信息', () => api.getDeviceInfo(), setDeviceInfo),
+      fetchInto('sim', 'SIM 信息', () => api.getSimInfo(), setSimInfo),
+      fetchInto('stats', '系统状态', () => api.getSystemStats(), (stats) => {
+        setSystemStats(stats)
+        updateSpeedHistory(stats)
+      }),
+      fetchInto('network', '网络信息', () => api.getNetworkInfo(), setNetworkInfo),
+      fetchInto('data', '数据连接状态', () => api.getDataStatus(), (status) => setDataStatus(status.active)),
+      fetchInto('cells', '小区信息', () => api.getCellsInfo(), setCellsInfo),
+      fetchInto('qos', 'QoS 信息', () => api.getQosInfo(), setQosInfo),
+      fetchInto('airplane', '飞行模式状态', () => api.getAirplaneMode(), setAirplaneMode),
+      fetchInto('ims', 'IMS 状态', () => api.getImsStatus(), setImsStatus),
+      fetchInto('roaming', '漫游状态', () => api.getRoamingStatus(), setRoaming),
+    ])
+  }, [fetchInto, updateSpeedHistory])
 
   const loadConnectivity = useCallback(async () => {
-    try {
-      const response = await api.getConnectivity()
-      if (response.data) {
-        setConnectivity(response.data)
-      }
-    } catch (errorValue) {
-      setError((currentError) => currentError ?? formatRequestError('连通性检测', errorValue))
-    }
-  }, [formatRequestError])
+    await fetchInto('connectivity', '连通性检测', () => api.getConnectivity(), setConnectivity)
+  }, [fetchInto])
 
   const toggleData = useCallback(async () => {
     if (dataStatus === null) return

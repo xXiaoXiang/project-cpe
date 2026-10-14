@@ -133,7 +133,7 @@ fn validate_euicc_identifier(iccid: &str) -> Result<(), String> {
 
 /// GET /api/euicc - 检查 eUICC 并列出已安装 Profile
 pub async fn get_euicc_info(State(_conn): State<Arc<Connection>>) -> Response {
-    let result = crate::serial::with_serial(async {
+    let result = crate::serial::with_euicc_serial(async {
         let chip_args = vec!["chip".to_string(), "info".to_string()];
         let chip_info = run_lpac_json(&chip_args).await?;
         let eid = chip_info
@@ -186,7 +186,7 @@ pub async fn enable_euicc_profile(
         request.iccid.clone(),
         "1".to_string(),
     ];
-    let result: Result<Vec<EuiccProfile>, String> = crate::serial::with_serial(async {
+    let result: Result<Vec<EuiccProfile>, String> = crate::serial::with_euicc_serial(async {
         run_lpac_json(&args).await?;
 
         let list_args = vec!["profile".to_string(), "list".to_string()];
@@ -259,7 +259,7 @@ pub async fn delete_euicc_profile(
         "delete".to_string(),
         request.iccid.clone(),
     ];
-    let result = crate::serial::with_serial(async { run_lpac_json(&args).await }).await;
+    let result = crate::serial::with_euicc_serial(async { run_lpac_json(&args).await }).await;
     match result {
         Ok(_) => (
             StatusCode::OK,
@@ -344,7 +344,7 @@ pub async fn download_euicc_profile(
 
     let (sender, receiver) = mpsc::channel::<Bytes>(32);
     tokio::spawn(async move {
-        crate::serial::with_serial(async move {
+        crate::serial::with_euicc_serial(async move {
             let spawn_result = lpac_command(&args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -2872,9 +2872,14 @@ pub async fn set_apn_handler(
 /// GET /api/connectivity - 联网检测
 ///
 /// 通过 ping 检测 IPv4 和 IPv6 连通性
-pub async fn get_connectivity_check() -> (StatusCode, Json<ApiResponse<ConnectivityCheckResponse>>) {
-    let ipv4_result = ping_host("223.5.5.5", false);
-    let ipv6_result = ping_host("2400:3200::1", true);
+pub async fn get_connectivity_check(
+    State(conn): State<Arc<Connection>>,
+) -> (StatusCode, Json<ApiResponse<ConnectivityCheckResponse>>) {
+    let (ipv4_target, ipv6_target) = connectivity_targets(&conn).await;
+    let (ipv4_result, ipv6_result) = tokio::join!(
+        ping_host(ipv4_target, false),
+        ping_host(ipv6_target, true),
+    );
     
     let response = ConnectivityCheckResponse {
         ipv4: ipv4_result,
@@ -2887,14 +2892,35 @@ pub async fn get_connectivity_check() -> (StatusCode, Json<ApiResponse<Connectiv
     )
 }
 
+/// 中国大陆（MCC 460）用阿里 DNS，其他地区用 Cloudflare anycast；无法获取 MCC 时沿用原有目标
+async fn connectivity_targets(conn: &Connection) -> (&'static str, &'static str) {
+    const MAINLAND: (&str, &str) = ("223.5.5.5", "2400:3200::1");
+    const GLOBAL: (&str, &str) = ("1.1.1.1", "2606:4700:4700::1111");
+
+    let mcc = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        crate::dbus::get_registered_mcc(conn),
+    )
+    .await
+    .ok()
+    .flatten();
+
+    match mcc.as_deref() {
+        Some("460") | None => MAINLAND,
+        Some(_) => GLOBAL,
+    }
+}
+
 /// 执行 ping 检测
-fn ping_host(target: &str, is_ipv6: bool) -> PingResult {
+async fn ping_host(target: &str, is_ipv6: bool) -> PingResult {
     let cmd = if is_ipv6 { "ping6" } else { "ping" };
     
     // 使用 -c 1 只发一个包，-W 2 设置超时 2 秒
-    let output = Command::new(cmd)
+    let output = TokioCommand::new(cmd)
         .args(["-c", "1", "-W", "2", target])
-        .output();
+        .kill_on_drop(true)
+        .output()
+        .await;
     
     match output {
         Ok(result) => {
