@@ -25,8 +25,8 @@ export function NetworkSpeed({ systemStats, speedHistory }: NetworkSpeedProps) {
   const theme = useTheme<Theme>()
 
   return (
-    <Card sx={{ height: '100%', overflow: 'hidden' }}>
-      <CardContent>
+    <Card sx={{ height: '100%', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+      <CardContent sx={{ flex: 1, display: 'flex', flexDirection: 'column', '&:last-child': { pb: 2 } }}>
         <Box display="flex" alignItems="center" gap={1} mb={2}>
           <Speed color="primary" />
           <Typography variant="subtitle2" color="text.secondary">
@@ -39,6 +39,7 @@ export function NetworkSpeed({ systemStats, speedHistory }: NetworkSpeedProps) {
         {systemStats?.network_speed?.interfaces && systemStats.network_speed.interfaces.length > 0 ? (
           <Box
             sx={{
+              flex: 1,
               display: 'grid',
               gridTemplateColumns: {
                 xs: '1fr',
@@ -60,6 +61,8 @@ export function NetworkSpeed({ systemStats, speedHistory }: NetworkSpeedProps) {
                   sx={{
                     p: 2,
                     overflow: 'hidden',
+                    display: 'flex',
+                    flexDirection: 'column',
                     background: (() => {
                       const paperColor = (theme.palette.background as { paper: string }).paper
                       return alpha(paperColor, 0.6)
@@ -73,7 +76,7 @@ export function NetworkSpeed({ systemStats, speedHistory }: NetworkSpeedProps) {
                     </Typography>
                   </Box>
 
-                  <Box mb={1.5}>
+                  <Box mb={1.5} sx={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
                     <Box display="flex" alignItems="center" justifyContent="space-between" mb={0.5}>
                       <Box display="flex" alignItems="center" gap={0.5}>
                         <ArrowDownward fontSize="small" sx={{ color: (theme.palette.success as { main: string }).main }} />
@@ -95,21 +98,22 @@ export function NetworkSpeed({ systemStats, speedHistory }: NetworkSpeedProps) {
                       </Typography>
                     </Box>
                     {rxData.length > 1 && (
-                      <Box sx={{ height: 40, width: '100%' }}>
-                        <SparkLineChart
-                          data={rxData}
-                          height={40}
-                          area
-                          curve="natural"
-                          color={(theme.palette.success as { main: string }).main}
-                          yAxis={{ min: 0, max: maxSpeed * 1.1 }}
-                          margin={{ top: 2, bottom: 2, left: 0, right: 0 }}
-                        />
+                      <Box sx={{ flex: 1, minHeight: 40, position: 'relative' }}>
+                        <Box sx={{ position: 'absolute', inset: 0 }}>
+                          <SparkLineChart
+                            data={rxData}
+                            area
+                            curve="natural"
+                            color={(theme.palette.success as { main: string }).main}
+                            yAxis={{ min: 0, max: maxSpeed * 1.1 }}
+                            margin={{ top: 2, bottom: 2, left: 0, right: 0 }}
+                          />
+                        </Box>
                       </Box>
                     )}
                   </Box>
 
-                  <Box>
+                  <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
                     <Box display="flex" alignItems="center" justifyContent="space-between" mb={0.5}>
                       <Box display="flex" alignItems="center" gap={0.5}>
                         <ArrowUpward fontSize="small" sx={{ color: (theme.palette.primary as { main: string }).main }} />
@@ -131,16 +135,17 @@ export function NetworkSpeed({ systemStats, speedHistory }: NetworkSpeedProps) {
                       </Typography>
                     </Box>
                     {txData.length > 1 && (
-                      <Box sx={{ height: 40, width: '100%' }}>
-                        <SparkLineChart
-                          data={txData}
-                          height={40}
-                          area
-                          curve="natural"
-                          color={(theme.palette.primary as { main: string }).main}
-                          yAxis={{ min: 0, max: maxSpeed * 1.1 }}
-                          margin={{ top: 2, bottom: 2, left: 0, right: 0 }}
-                        />
+                      <Box sx={{ flex: 1, minHeight: 40, position: 'relative' }}>
+                        <Box sx={{ position: 'absolute', inset: 0 }}>
+                          <SparkLineChart
+                            data={txData}
+                            area
+                            curve="natural"
+                            color={(theme.palette.primary as { main: string }).main}
+                            yAxis={{ min: 0, max: maxSpeed * 1.1 }}
+                            margin={{ top: 2, bottom: 2, left: 0, right: 0 }}
+                          />
+                        </Box>
                       </Box>
                     )}
                   </Box>
