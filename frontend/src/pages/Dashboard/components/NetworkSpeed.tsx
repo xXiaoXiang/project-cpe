@@ -8,7 +8,7 @@
  *
  * Copyright (c) 2025 by 1orz, All Rights Reserved.
  */
-import { Box, Card, CardContent, Typography, Stack, Chip, Paper, useTheme, type Theme } from '@mui/material'
+import { Box, Card, CardContent, Typography, Chip, Paper, useTheme, type Theme } from '@mui/material'
 import { alpha } from '@/utils/theme'
 import { Speed, ArrowDownward, ArrowUpward } from '@mui/icons-material'
 import { SparkLineChart } from '@mui/x-charts/SparkLineChart'
@@ -37,7 +37,16 @@ export function NetworkSpeed({ systemStats, speedHistory }: NetworkSpeedProps) {
           </Typography>
         </Box>
         {systemStats?.network_speed?.interfaces && systemStats.network_speed.interfaces.length > 0 ? (
-          <Stack spacing={2}>
+          <Box
+            sx={{
+              display: 'grid',
+              gridTemplateColumns: {
+                xs: '1fr',
+                md: systemStats.network_speed.interfaces.length > 1 ? 'repeat(2, minmax(0, 1fr))' : '1fr',
+              },
+              gap: 2,
+            }}
+          >
             {systemStats.network_speed.interfaces.map((iface) => {
               const history = speedHistory[iface.interface]
               const rxData = history?.rx || []
@@ -57,7 +66,7 @@ export function NetworkSpeed({ systemStats, speedHistory }: NetworkSpeedProps) {
                     })(),
                   }}
                 >
-                  <Box display="flex" alignItems="center" justifyContent="space-between" mb={1.5}>
+                  <Box display="flex" alignItems="center" justifyContent="space-between" flexWrap="wrap" gap={1} mb={1.5}>
                     <Chip label={iface.interface} size="small" variant="outlined" sx={{ fontFamily: 'monospace', fontWeight: 500 }} />
                     <Typography variant="caption" color="text.secondary">
                       总流量 ↓ {formatBytes(iface.total_rx_bytes)} / ↑ {formatBytes(iface.total_tx_bytes)}
@@ -138,7 +147,7 @@ export function NetworkSpeed({ systemStats, speedHistory }: NetworkSpeedProps) {
                 </Paper>
               )
             })}
-          </Stack>
+          </Box>
         ) : (
           <Typography variant="body2" color="text.secondary">
             暂无数据

@@ -9,8 +9,8 @@
  * Copyright (c) 2025 by 1orz, All Rights Reserved.
  */
 import { Box, Card, CardContent, Typography, Stack, LinearProgress, Chip, Tooltip } from '@mui/material'
-import { Speed, Memory, Storage, Thermostat, Usb, Info } from '@mui/icons-material'
-import { formatBytes, getCpuColor, getMemoryColor, getTempColor } from '../utils'
+import { Speed, Memory, Storage, Usb, Info } from '@mui/icons-material'
+import { formatBytes, getCpuColor, getMemoryColor } from '../utils'
 import type { SystemStatsResponse } from '@/api/types'
 
 interface SystemResourcesProps {
@@ -18,16 +18,6 @@ interface SystemResourcesProps {
 }
 
 export function SystemResources({ systemStats }: SystemResourcesProps) {
-  const getMainTemp = () => {
-    if (systemStats?.temperature && systemStats.temperature.length > 0) {
-      const socSensor = systemStats.temperature.find((s) => s.type.includes('soc'))
-      return socSensor?.temperature || systemStats.temperature[0].temperature
-    }
-    return null
-  }
-
-  const mainTemp = getMainTemp()
-
   return (
     <Card sx={{ height: '100%' }}>
       <CardContent>
@@ -113,20 +103,6 @@ export function SystemResources({ systemStats }: SystemResourcesProps) {
               ))}
             </Box>
           )}
-
-          <Box display="flex" justifyContent="space-between" alignItems="center">
-            <Box display="flex" alignItems="center" gap={0.5}>
-              <Thermostat fontSize="small" color="action" />
-              <Typography variant="caption" color="text.secondary">
-                温度
-              </Typography>
-            </Box>
-            {mainTemp !== null ? (
-              <Chip label={`${mainTemp.toFixed(0)}°C`} size="small" color={getTempColor(mainTemp)} />
-            ) : (
-              <Typography variant="caption">-</Typography>
-            )}
-          </Box>
 
           <Box display="flex" justifyContent="space-between" alignItems="center">
             <Typography variant="caption" color="text.secondary">

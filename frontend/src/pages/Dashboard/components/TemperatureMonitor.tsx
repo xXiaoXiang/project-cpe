@@ -8,7 +8,7 @@
  *
  * Copyright (c) 2025 by 1orz, All Rights Reserved.
  */
-import { Box, Card, CardContent, Typography, Paper } from '@mui/material'
+import { Box, Card, CardContent, Chip, Typography, Paper } from '@mui/material'
 import Grid from '@mui/material/Grid'
 import { Thermostat } from '@mui/icons-material'
 import { getTempColor } from '../utils'
@@ -19,14 +19,24 @@ interface TemperatureMonitorProps {
 }
 
 export function TemperatureMonitor({ systemStats }: TemperatureMonitorProps) {
+  const sensors = systemStats?.temperature
+  const mainSensor = sensors?.find((sensor) => sensor.type.includes('soc')) ?? sensors?.[0]
+
   return (
-    <Card>
+    <Card sx={{ height: '100%' }}>
       <CardContent>
         <Box display="flex" alignItems="center" gap={1} mb={2}>
           <Thermostat color="primary" />
           <Typography variant="subtitle2" color="text.secondary">
             温度监控
           </Typography>
+          {mainSensor && (
+            <Chip
+              label={`${mainSensor.temperature.toFixed(0)}°C`}
+              size="small"
+              color={getTempColor(mainSensor.temperature)}
+            />
+          )}
         </Box>
         {systemStats?.temperature && systemStats.temperature.length > 0 ? (
           <Grid container spacing={1}>
