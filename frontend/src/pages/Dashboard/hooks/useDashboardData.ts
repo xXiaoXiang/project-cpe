@@ -10,13 +10,13 @@
  */
 import { useState, useCallback, useRef } from 'react'
 import { api } from '@/api'
+import { useApiRequests } from '@/hooks/useApiRequests'
 import {
   getAdaptiveRefreshInterval,
   useAdaptivePolling,
   usePageVisibility,
 } from '@/hooks/useAdaptivePolling'
 import type {
-  ApiResponse,
   DeviceInfo,
   NetworkInfo,
   CellsResponse,
@@ -68,8 +68,7 @@ const CONNECTIVITY_MIN_REFRESH_INTERVAL = 15_000
 const CONNECTIVITY_HIDDEN_MIN_REFRESH_INTERVAL = 60_000
 
 export function useDashboardData(refreshInterval: number, refreshKey: number) {
-  const [initialLoading, setInitialLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const { initialLoading, error, setError, fetchInto } = useApiRequests()
 
   const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null)
   const [simInfo, setSimInfo] = useState<SimInfo | null>(null)
@@ -85,8 +84,6 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
 
   const [speedHistory, setSpeedHistory] = useState<Record<string, InterfaceSpeedHistory>>({})
   const speedHistoryRef = useRef<Record<string, InterfaceSpeedHistory>>({})
-  const inFlightRef = useRef(new Set<string>())
-  const errorsRef = useRef(new Map<string, string>())
 
   const updateSpeedHistory = useCallback((stats: SystemStatsResponse | null) => {
     if (!stats?.network_speed?.interfaces) return
@@ -116,44 +113,14 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
     setSpeedHistory(newHistory)
   }, [])
 
-  const formatRequestError = useCallback((label: string, errorValue: unknown) => {
-    const message = errorValue instanceof Error ? errorValue.message : String(errorValue)
-    return `${label}: ${message}`
-  }, [])
-
   const isPageVisible = usePageVisibility()
   const connectivityRefreshInterval = getAdaptiveRefreshInterval(
-    Math.max(refreshInterval, CONNECTIVITY_MIN_REFRESH_INTERVAL),
+    refreshInterval > 0 ? Math.max(refreshInterval, CONNECTIVITY_MIN_REFRESH_INTERVAL) : 0,
     isPageVisible,
     {
       hiddenMinInterval: CONNECTIVITY_HIDDEN_MIN_REFRESH_INTERVAL,
       hiddenMultiplier: 4,
     }
-  )
-
-  // 每个接口独立更新；同一接口上一次请求未返回时跳过本轮，避免慢接口堆积请求
-  const fetchInto = useCallback(
-    async <T,>(
-      key: string,
-      label: string,
-      request: () => Promise<ApiResponse<T>>,
-      apply: (data: T) => void
-    ) => {
-      if (inFlightRef.current.has(key)) return
-      inFlightRef.current.add(key)
-      try {
-        const response = await request()
-        if (response.data) apply(response.data)
-        errorsRef.current.delete(key)
-      } catch (errorValue) {
-        errorsRef.current.set(key, formatRequestError(label, errorValue))
-      } finally {
-        inFlightRef.current.delete(key)
-        setInitialLoading(false)
-        setError(errorsRef.current.values().next().value ?? null)
-      }
-    },
-    [formatRequestError]
   )
 
   const loadData = useCallback(async () => {
@@ -188,7 +155,7 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     }
-  }, [dataStatus])
+  }, [dataStatus, setError])
 
   const toggleAirplaneMode = useCallback(async () => {
     if (!airplaneMode) return
@@ -202,7 +169,7 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     }
-  }, [airplaneMode])
+  }, [airplaneMode, setError])
 
   const toggleRoaming = useCallback(async () => {
     if (!roaming) return
@@ -216,7 +183,7 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     }
-  }, [roaming])
+  }, [roaming, setError])
 
   useAdaptivePolling({
     refreshInterval,

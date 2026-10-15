@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 const DEFAULT_HIDDEN_MIN_INTERVAL = 30_000
 const DEFAULT_HIDDEN_MULTIPLIER = 6
@@ -65,6 +65,8 @@ export function useAdaptivePolling({
   hiddenMinInterval,
   hiddenMultiplier,
 }: AdaptivePollingOptions) {
+  const tickRef = useRef(onTick)
+  useEffect(() => { tickRef.current = onTick }, [onTick])
   const isPageVisible = usePageVisibility()
   const effectiveRefreshInterval = useMemo(
     () =>
@@ -77,7 +79,7 @@ export function useAdaptivePolling({
 
   useEffect(() => {
     if (immediate) {
-      void onTick()
+      void tickRef.current()
     }
 
     if (effectiveRefreshInterval <= 0) {
@@ -85,13 +87,14 @@ export function useAdaptivePolling({
     }
 
     const timer = window.setInterval(() => {
-      void onTick()
+      // Each task guards its own pending request; a slow endpoint must not block others.
+      void tickRef.current()
     }, effectiveRefreshInterval)
 
     return () => {
       window.clearInterval(timer)
     }
-  }, [effectiveRefreshInterval, immediate, onTick, refreshKey])
+  }, [effectiveRefreshInterval, immediate, refreshKey])
 
   return {
     effectiveRefreshInterval,

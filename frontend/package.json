@@ -10,7 +10,9 @@
     "lint": "eslint . --max-warnings 0",
     "lint:fix": "eslint . --fix",
     "preview": "vite preview",
-    "type-check": "tsc -b --noEmit"
+    "type-check": "tsc -b --noEmit",
+    "test": "node --test tests/requests.test.ts tests/euicc.test.ts",
+    "test:pages": "node --test tests/pages.test.ts"
   },
   "dependencies": {
     "@emotion/react": "^11.14.0",

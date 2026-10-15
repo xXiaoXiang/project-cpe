@@ -15,6 +15,11 @@ import type {
   EuiccInfo,
   EuiccProfile,
   EuiccDownloadRequest,
+  LpacEvent,
+  LpacPayload,
+  EuiccNotification,
+  EuiccNotificationTarget,
+  EuiccNotificationRemoval,
   NetworkInfo,
   CellsResponse,
   QosInfo,
@@ -78,34 +83,9 @@ import type {
   OtaUploadResponse,
 } from './types'
 
-// API 基础配置
+import { request } from './request.ts'
+
 const API_BASE = '/api'
-
-// 通用请求函数
-async function request<T>(
-  url: string,
-  options: RequestInit & { returnText?: boolean } = {}
-): Promise<T> {
-  const { returnText, ...fetchOptions } = options
-  
-  const response = await fetch(`${API_BASE}${url}`, {
-    headers: {
-      'Content-Type': 'application/json',
-      ...fetchOptions.headers,
-    },
-    ...fetchOptions,
-  })
-
-  if (!response.ok) {
-    throw new Error(`HTTP error! status: ${response.status}`)
-  }
-
-  if (returnText) {
-    return (await response.text()) as T
-  }
-
-  return await response.json() as T
-}
 
 // API 类
 class UDX710API {
@@ -146,10 +126,36 @@ class UDX710API {
     return request<ApiResponse<Record<string, never>>>('/euicc/refresh-sim', { method: 'POST' })
   }
 
+  async setEuiccNickname(iccid: string, nickname: string) {
+    if (Array.from(nickname).length > 32 || /[\p{Cc}]/u.test(nickname)) {
+      throw new Error('昵称最多 32 个字符，且不能包含控制字符')
+    }
+    return request<ApiResponse<{ iccid: string; nickname: string }>>('/euicc/profile/nickname', {
+      method: 'POST', body: JSON.stringify({ iccid, nickname }),
+    })
+  }
+
+  async getEuiccNotifications() {
+    return request<ApiResponse<EuiccNotification[]>>('/euicc/notifications', { cache: 'no-store' })
+  }
+
+  async processEuiccNotifications(target: EuiccNotificationTarget) {
+    return request<ApiResponse<Record<string, never>>>('/euicc/notifications/process', {
+      method: 'POST', body: JSON.stringify(target),
+    })
+  }
+
+  async removeEuiccNotifications(target: EuiccNotificationTarget) {
+    return request<ApiResponse<EuiccNotificationRemoval>>('/euicc/notifications/remove', {
+      method: 'POST', body: JSON.stringify(target),
+    })
+  }
+
   async downloadEuiccProfile(
     payload: EuiccDownloadRequest,
-    onOutput: (text: string) => void
-  ): Promise<void> {
+    onOutput: (text: string) => void,
+    onEvent?: (event: LpacEvent) => void,
+  ): Promise<LpacPayload> {
     const response = await fetch(`${API_BASE}/euicc/profile/download`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -157,7 +163,7 @@ class UDX710API {
     })
 
     if (!response.ok) {
-      let message = `HTTP error! status: ${response.status}`
+      let message = `下载请求失败（HTTP ${response.status}）`
       try {
         const body = await response.json() as ApiResponse<unknown>
         message = body.message || message
@@ -167,12 +173,12 @@ class UDX710API {
       throw new Error(message)
     }
 
-    if (!response.body) throw new Error('Download stream is unavailable')
+    if (!response.body) throw new Error('无法读取下载进度，请刷新列表确认是否已安装')
 
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
     let pending = ''
-    const completion: { value?: { success: boolean; message: string } } = {}
+    const completion: { value?: { success: boolean; message: string; result?: LpacPayload } } = {}
 
     const consumeLine = (line: string) => {
       if (!line.trim()) return
@@ -181,29 +187,41 @@ class UDX710API {
         text?: string
         success?: boolean
         message?: string
+        event?: LpacEvent
+        result?: LpacPayload
       }
       if (event.type === 'output' && event.text) onOutput(event.text)
+      if (event.type === 'lpac' && event.event) onEvent?.(event.event)
       if (event.type === 'complete') {
         completion.value = {
           success: event.success === true,
-          message: event.message || 'LPAC download failed',
+          message: event.message || 'LPAC 下载失败',
+          result: event.result,
         }
       }
     }
 
-    while (true) {
-      const { value, done } = await reader.read()
-      pending += decoder.decode(value, { stream: !done })
-      const lines = pending.split('\n')
-      pending = lines.pop() || ''
-      lines.forEach(consumeLine)
-      if (done) break
+    try {
+      while (true) {
+        const { value, done } = await reader.read()
+        pending += decoder.decode(value, { stream: !done })
+        const lines = pending.split('\n')
+        pending = lines.pop() || ''
+        lines.forEach(consumeLine)
+        if (done) break
+      }
+      consumeLine(pending)
+    } catch {
+      throw new Error('下载连接中断或输出不完整，请刷新列表确认是否已安装')
+    } finally {
+      reader.releaseLock()
     }
-    consumeLine(pending)
 
     const result = completion.value
-    if (!result) throw new Error('LPAC stream ended without a completion status')
+    if (!result) throw new Error('下载连接已中断，未收到最终结果，请刷新列表确认是否已安装')
     if (!result.success) throw new Error(result.message)
+    if (!result.result || result.result.code !== 0) throw new Error('LPAC 未确认下载成功，请刷新列表确认是否已安装')
+    return result.result
   }
 
   // 网络信息
@@ -720,5 +738,5 @@ class UDX710API {
 export const api = new UDX710API()
 
 // 导出类型
-export * from './types'
+export * from './types.ts'
 

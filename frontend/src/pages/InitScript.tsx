@@ -33,6 +33,7 @@ import {
   WarningAmber,
 } from '@mui/icons-material'
 import { api } from '../api'
+import { useSingleFlight } from '../hooks/useSingleFlight'
 import ErrorSnackbar from '../components/ErrorSnackbar'
 
 const FORMAT_CHECK_ENABLED_KEY = 'init-script-format-check-enabled'
@@ -259,6 +260,7 @@ function buildSensitiveLineMap(matches: SensitiveCommandMatch[]): Record<number,
 }
 
 export default function InitScriptPage() {
+  const run = useSingleFlight()
   const theme = useTheme()
   const isMobile = useMediaQuery(theme.breakpoints.down('sm'))
   const [loading, setLoading] = useState(true)
@@ -289,7 +291,7 @@ export default function InitScriptPage() {
     { label: '固定启动命令', value: 'sh /home/root/init.sh &' },
   ]
 
-  const loadScript = useCallback(async () => {
+  const loadScript = useCallback(() => run('script', async () => {
     setLoading(true)
     setError(null)
 
@@ -306,7 +308,7 @@ export default function InitScriptPage() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }), [run])
 
   useEffect(() => {
     void loadScript()

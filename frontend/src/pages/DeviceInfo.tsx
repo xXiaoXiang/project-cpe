@@ -8,7 +8,7 @@
  * 
  * Copyright (c) 2025 by 1orz, All Rights Reserved. 
  */
-import { useEffect, useState } from 'react'
+import { useCallback, useState } from 'react'
 import { useRevealAll } from '../contexts/revealSensitive'
 import {
   Box,
@@ -39,12 +39,15 @@ import {
 } from '@mui/icons-material'
 import Grid from '@mui/material/Grid'
 import { api } from '../api'
+import { useApiRequests } from '../hooks/useApiRequests'
+import { useAdaptivePolling } from '../hooks/useAdaptivePolling'
+import { useRefreshInterval } from '../contexts/RefreshContext'
 import ErrorSnackbar from '../components/ErrorSnackbar'
 import type { DeviceInfo, SimInfo, SimSlotResponse, ImeisvResponse } from '../api/types'
 
 export default function DeviceInfoPage() {
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const { refreshInterval, refreshKey } = useRefreshInterval()
+  const { initialLoading: loading, error, setError, fetchInto } = useApiRequests()
   const [success, setSuccess] = useState<string | null>(null)
   // 每个功能块独立的敏感信息显示状态
   const revealAll = useRevealAll()
@@ -63,36 +66,14 @@ export default function DeviceInfoPage() {
   const [simSlot, setSimSlot] = useState<SimSlotResponse | null>(null)
   const [switchingSlot, setSwitchingSlot] = useState(false)
 
-  const loadData = async () => {
-    setLoading(true)
-    setError(null)
-    
-    try {
-      const [deviceRes, simRes] = await Promise.all([
-        api.getDeviceInfo(),
-        api.getSimInfo(),
-      ])
-      
-      if (deviceRes.data) setDeviceInfo(deviceRes.data)
-      if (simRes.data) setSimInfo(simRes.data)
-
-      // 加载扩展数据
-      try {
-        const [imeisvRes, simSlotRes] = await Promise.all([
-          api.getImeisv(),
-          api.getSimSlot(),
-        ])
-        if (imeisvRes.data) setImeisv(imeisvRes.data)
-        if (simSlotRes.data) setSimSlot(simSlotRes.data)
-      } catch (extErr) {
-        console.warn('部分扩展信息加载失败:', extErr)
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setLoading(false)
-    }
-  }
+  const loadData = useCallback(async () => {
+    await Promise.allSettled([
+      fetchInto('device', '设备信息', () => api.getDeviceInfo(), setDeviceInfo),
+      fetchInto('sim', 'SIM 信息', () => api.getSimInfo(), setSimInfo),
+      fetchInto('imeisv', 'IMEISV', () => api.getImeisv(), setImeisv),
+      fetchInto('slot', 'SIM 卡槽', () => api.getSimSlot(), setSimSlot),
+    ])
+  }, [fetchInto])
 
   const handleSwitchSimSlot = () => {
     void switchSimSlot()
@@ -125,9 +106,7 @@ export default function DeviceInfoPage() {
     cursor: show ? 'text' : 'default',
   })
 
-  useEffect(() => {
-    void loadData()
-  }, [])
+  useAdaptivePolling({ refreshInterval, refreshKey, onTick: loadData })
 
   if (loading) {
     return (

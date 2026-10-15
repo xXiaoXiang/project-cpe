@@ -8,7 +8,7 @@
  * 
  * Copyright (c) 2025 by 1orz, All Rights Reserved. 
  */
-import { useState, useRef, useEffect, type ChangeEvent } from 'react'
+import { useState, useRef, useEffect, useCallback, type ChangeEvent } from 'react'
 import {
   Box,
   Typography,
@@ -31,6 +31,7 @@ import {
   Delete,
 } from '@mui/icons-material'
 import { api } from '../api'
+import { useSingleFlight } from '../hooks/useSingleFlight'
 import ErrorSnackbar from '../components/ErrorSnackbar'
 
 interface CommandHistory {
@@ -51,6 +52,7 @@ const QUICK_COMMANDS = [
 ]
 
 export default function ATConsolePage() {
+  const run = useSingleFlight()
   const [command, setCommand] = useState('')
   const [history, setHistory] = useState<CommandHistory[]>([])
   const [loading, setLoading] = useState(false)
@@ -66,13 +68,8 @@ export default function ATConsolePage() {
     responseEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [history])
 
-  // 初始加载：获取当前 IMEI
-  useEffect(() => {
-    void fetchCurrentImei()
-  }, [])
-
   // 获取当前 IMEI
-  const fetchCurrentImei = async () => {
+  const fetchCurrentImei = useCallback(() => run('imei', async () => {
     setImeiLoading(true)
     try {
       const response = await api.sendAtCommand('AT+SPIMEI?')
@@ -86,7 +83,11 @@ export default function ATConsolePage() {
     } finally {
       setImeiLoading(false)
     }
-  }
+  }), [run])
+
+  useEffect(() => {
+    void fetchCurrentImei()
+  }, [fetchCurrentImei])
 
   // 发送 AT 指令的实际逻辑
   const sendCommand = async (cmd?: string) => {

@@ -72,6 +72,8 @@ import {
 } from '@mui/icons-material'
 import { api, type CallInfo, type CallVolumeResponse, type CallForwardingResponse, type CallSettingsResponse, type CallRecord, type CallStats } from '../api'
 import { useRefreshInterval } from '../contexts/RefreshContext'
+import { useAdaptivePolling } from '../hooks/useAdaptivePolling'
+import { useSingleFlight } from '../hooks/useSingleFlight'
 
 // 拨号盘按键
 const dialpadButtons = [
@@ -83,6 +85,7 @@ const dialpadButtons = [
 
 export default function PhonePage() {
   const { refreshInterval, refreshKey } = useRefreshInterval()
+  const run = useSingleFlight()
   const [tabValue, setTabValue] = useState(0)
   const [calls, setCalls] = useState<CallInfo[]>([])
   const [_loading, setLoading] = useState(false)
@@ -116,7 +119,7 @@ export default function PhonePage() {
   const [settingsLoading, setSettingsLoading] = useState(false)
 
   // 获取通话列表
-  const fetchCalls = useCallback(async () => {
+  const fetchCalls = useCallback(() => run('calls', async () => {
     setLoading(true)
     try {
       const response = await api.getCalls()
@@ -128,10 +131,10 @@ export default function PhonePage() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }), [run])
 
   // 获取通话记录
-  const fetchCallHistory = useCallback(async () => {
+  const fetchCallHistory = useCallback(() => run('history', async () => {
     setHistoryLoading(true)
     try {
       const response = await api.getCallHistory(100, 0)
@@ -144,10 +147,10 @@ export default function PhonePage() {
     } finally {
       setHistoryLoading(false)
     }
-  }, [])
+  }), [run])
 
   // 获取音量设置
-  const fetchVolume = useCallback(async () => {
+  const fetchVolume = useCallback(() => run('volume', async () => {
     try {
       const response = await api.getCallVolume()
       if (response.status === 'ok' && response.data) {
@@ -159,10 +162,10 @@ export default function PhonePage() {
     } catch (err) {
       console.warn('获取音量设置失败:', err)
     }
-  }, [])
+  }), [run])
 
   // 获取呼叫转移设置
-  const fetchForwarding = async () => {
+  const fetchForwarding = () => run('forwarding', async () => {
     setForwardingLoading(true)
     try {
       const response = await api.getCallForwarding()
@@ -174,10 +177,10 @@ export default function PhonePage() {
     } finally {
       setForwardingLoading(false)
     }
-  }
+  })
 
   // 获取通话设置
-  const fetchCallSettings = async () => {
+  const fetchCallSettings = () => run('settings', async () => {
     setSettingsLoading(true)
     try {
       const response = await api.getCallSettings()
@@ -189,27 +192,23 @@ export default function PhonePage() {
     } finally {
       setSettingsLoading(false)
     }
-  }
+  })
 
   useEffect(() => {
-    void fetchCalls()
-    void fetchVolume()
     void fetchCallHistory()
-    
-    // 每3秒自动刷新通话列表
-    if (refreshInterval <= 0) {
-      return undefined
-    }
+  }, [fetchCallHistory, refreshKey])
 
-    const interval = window.setInterval(() => {
-      void fetchCalls()
-      void fetchVolume()
-      if (tabValue === 1) {
-        void fetchCallHistory()
-      }
-    }, refreshInterval)
-    return () => window.clearInterval(interval)
-  }, [fetchCallHistory, fetchCalls, fetchVolume, refreshInterval, refreshKey, tabValue])
+  useAdaptivePolling({
+    refreshInterval,
+    refreshKey,
+    onTick: async () => {
+      await Promise.allSettled([
+        fetchCalls(),
+        fetchVolume(),
+        ...(tabValue === 1 ? [fetchCallHistory()] : []),
+      ])
+    },
+  })
 
   // 拨号盘按键点击
   const handleDialpadPress = (digit: string) => {

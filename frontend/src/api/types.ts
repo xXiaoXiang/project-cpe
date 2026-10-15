@@ -64,6 +64,35 @@ export interface EuiccDownloadRequest {
   imei?: string
 }
 
+export interface LpacPayload {
+  code: number
+  message: string
+  data: unknown
+}
+
+export interface LpacEvent {
+  type: 'progress' | 'lpa'
+  payload: LpacPayload
+}
+
+export interface EuiccNotification {
+  seqNumber: number
+  iccid: string
+  profileManagementOperation: string
+}
+
+export interface EuiccNotificationTarget {
+  seq_number?: number
+  all?: boolean
+  confirm_sensitive?: boolean
+}
+
+export interface EuiccNotificationRemoval {
+  removed: number[]
+  failed: { seqNumber: number; message: string }[]
+  skipped: number
+}
+
 // 网络信息
 export interface NetworkInfo {
   operator_name: string

@@ -53,6 +53,9 @@ import {
 import { api } from '../api'
 import ErrorSnackbar from '../components/ErrorSnackbar'
 import { useRefreshInterval } from '../contexts/RefreshContext'
+import { useApiRequests } from '../hooks/useApiRequests'
+import { useAdaptivePolling } from '../hooks/useAdaptivePolling'
+import { useSingleFlight } from '../hooks/useSingleFlight'
 import type { UsbModeResponse, AirplaneModeResponse, WebhookConfig, SmsPushConfig, SmsPushProvider } from '../api/types'
 import { DEFAULT_SMS_TEMPLATE, DEFAULT_CALL_TEMPLATE, DEFAULT_SMS_PUSH_TITLE_TEMPLATE, DEFAULT_SMS_PUSH_BODY_TEMPLATE } from '../api/types'
 
@@ -149,8 +152,8 @@ function createDefaultSmsPushConfig(): SmsPushConfig {
 
 export default function ConfigurationPage() {
   const { refreshInterval, refreshKey } = useRefreshInterval()
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const { initialLoading: loading, error, setError, fetchInto, ready } = useApiRequests()
+  const run = useSingleFlight()
   const [success, setSuccess] = useState<string | null>(null)
   const [expanded, setExpanded] = useState<string | false>('dataConnection')
   
@@ -191,7 +194,7 @@ export default function ConfigurationPage() {
   const [smsPushLoading, setSmsPushLoading] = useState(false)
   const [smsPushTesting, setSmsPushTesting] = useState(false)
 
-  const checkHealth = useCallback(async () => {
+  const checkHealth = useCallback(() => run('health', async () => {
     setHealthLoading(true)
     try {
       const response = await api.health()
@@ -207,48 +210,30 @@ export default function ConfigurationPage() {
     } finally {
       setHealthLoading(false)
     }
-  }, [])
+  }), [run])
 
   const loadData = useCallback(async () => {
-    setLoading(true)
-    setError(null)
-    
-    try {
-      const [dataRes, usbRes, airplaneModeRes, webhookRes, smsPushRes] = await Promise.all([
-        api.getDataStatus(),
-        api.getUsbMode(),
-        api.getAirplaneMode(),
-        api.getWebhookConfig(),
-        api.getSmsPushConfig(),
-      ])
-      
-      if (dataRes.data) setDataStatus(dataRes.data.active)
-      if (usbRes.data) {
-        setUsbMode(usbRes.data)
-        setSelectedUsbMode(usbRes.data.current_mode || 1)
-      }
-      if (airplaneModeRes.data) setAirplaneMode(airplaneModeRes.data)
-      if (webhookRes.data) setWebhookConfig(webhookRes.data)
-      if (smsPushRes.data) setSmsPushConfig(normalizeSmsPushConfig(smsPushRes.data))
-
-      // 加载健康检查
-      await checkHealth()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setLoading(false)
-    }
-  }, [checkHealth])
+    await Promise.allSettled([
+      fetchInto('data', '数据连接状态', () => api.getDataStatus(), (data) => setDataStatus(data.active)),
+      fetchInto('usb', 'USB 模式', () => api.getUsbMode(), (data) => {
+        setUsbMode(data)
+        setSelectedUsbMode(data.current_mode || 1)
+      }),
+      fetchInto('airplane', '飞行模式', () => api.getAirplaneMode(), setAirplaneMode),
+      fetchInto('webhook', 'Webhook 配置', () => api.getWebhookConfig(), setWebhookConfig),
+      fetchInto('sms-push', '短信推送配置', () => api.getSmsPushConfig(), (data) => setSmsPushConfig(normalizeSmsPushConfig(data))),
+    ])
+  }, [fetchInto])
 
   useEffect(() => {
     void loadData()
-    // 每30秒自动检查健康状态
-    const pollInterval = refreshInterval > 0 ? Math.max(refreshInterval * 6, 30000) : 60000
-    const interval = window.setInterval(() => {
-      void checkHealth()
-    }, pollInterval)
-    return () => window.clearInterval(interval)
-  }, [checkHealth, loadData, refreshInterval, refreshKey])
+  }, [loadData, refreshKey])
+
+  useAdaptivePolling({
+    refreshInterval: refreshInterval > 0 ? Math.max(refreshInterval * 6, 30000) : 60000,
+    refreshKey,
+    onTick: checkHealth,
+  })
 
   const handleAccordionChange = (panel: string) => (_event: React.SyntheticEvent, isExpanded: boolean) => {
     setExpanded(isExpanded ? panel : false)
@@ -618,7 +603,7 @@ export default function ConfigurationPage() {
               <Typography fontWeight={600}>数据连接配置</Typography>
               <Box flexGrow={1} />
               <Chip
-                label={dataStatus ? '已启用' : '已禁用'}
+                label={!ready.data ? '等待数据' : dataStatus ? '已启用' : '已禁用'}
                 color={dataStatus ? 'success' : 'default'}
                 size="small"
                 onClick={(e: MouseEvent) => e.stopPropagation()}
@@ -636,6 +621,7 @@ export default function ConfigurationPage() {
               control={
                 <Switch
                   checked={dataStatus}
+                  disabled={!ready.data}
                   onChange={handleDataToggle}
                   color="primary"
                 />
@@ -688,7 +674,7 @@ export default function ConfigurationPage() {
                 <Switch
                   checked={airplaneMode?.enabled || false}
                   onChange={handleAirplaneModeToggle}
-                  disabled={airplaneSwitching}
+                  disabled={airplaneSwitching || !ready.airplane}
                   color="warning"
                 />
               }
@@ -873,7 +859,7 @@ export default function ConfigurationPage() {
                 fullWidth
                 color={useHotSwitch ? 'warning' : 'primary'}
                 onClick={handleUsbModeApply}
-                disabled={hotSwitching || (selectedUsbMode === usbMode?.current_mode && !useHotSwitch)}
+                disabled={!ready.usb || hotSwitching || (selectedUsbMode === usbMode?.current_mode && !useHotSwitch)}
                 startIcon={hotSwitching ? <CircularProgress size={20} /> : (useHotSwitch ? <FlashOn /> : undefined)}
               >
                 {hotSwitching ? '切换中...' : (useHotSwitch ? '立即热切换' : '保存配置')}
@@ -945,6 +931,7 @@ export default function ConfigurationPage() {
               control={
                 <Switch
                   checked={webhookConfig.enabled}
+                  disabled={!ready.webhook}
                   onChange={(e: ChangeEvent<HTMLInputElement>) => setWebhookConfig({ ...webhookConfig, enabled: e.target.checked })}
                   color="success"
                 />
@@ -1124,7 +1111,7 @@ export default function ConfigurationPage() {
                 variant="contained"
                 fullWidth
                 onClick={() => void handleSaveWebhook()}
-                disabled={webhookLoading}
+                disabled={!ready.webhook || webhookLoading}
                 startIcon={webhookLoading ? <CircularProgress size={20} /> : undefined}
               >
                 {webhookLoading ? '保存中...' : '保存配置'}
@@ -1132,7 +1119,7 @@ export default function ConfigurationPage() {
               <Button
                 variant="outlined"
                 onClick={() => void handleTestWebhook()}
-                disabled={webhookTesting || !webhookConfig.enabled || !webhookConfig.url}
+                disabled={!ready.webhook || webhookTesting || !webhookConfig.enabled || !webhookConfig.url}
                 startIcon={webhookTesting ? <CircularProgress size={20} /> : <PlayArrow />}
               >
                 {webhookTesting ? '测试中...' : '测试'}
@@ -1177,6 +1164,7 @@ export default function ConfigurationPage() {
               control={(
                 <Switch
                   checked={smsPushConfig.enabled}
+                  disabled={!ready['sms-push']}
                   onChange={(e: ChangeEvent<HTMLInputElement>) => setSmsPushConfig({ ...smsPushConfig, enabled: e.target.checked })}
                   color="success"
                 />
@@ -1304,7 +1292,7 @@ export default function ConfigurationPage() {
                 variant="contained"
                 fullWidth
                 onClick={() => void handleSaveSmsPush()}
-                disabled={smsPushLoading}
+                disabled={!ready['sms-push'] || smsPushLoading}
                 startIcon={smsPushLoading ? <CircularProgress size={20} /> : undefined}
               >
                 {smsPushLoading ? '保存中...' : '保存配置'}
@@ -1312,7 +1300,7 @@ export default function ConfigurationPage() {
               <Button
                 variant="outlined"
                 onClick={() => void handleTestSmsPush()}
-                disabled={smsPushTesting || !smsPushCanTest}
+                disabled={!ready['sms-push'] || smsPushTesting || !smsPushCanTest}
                 startIcon={smsPushTesting ? <CircularProgress size={20} /> : <PlayArrow />}
               >
                 {smsPushTesting ? '测试中...' : '测试'}

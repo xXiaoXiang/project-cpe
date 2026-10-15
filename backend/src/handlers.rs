@@ -23,7 +23,7 @@ use futures_util::stream;
 use serde_json::{json, Value};
 use std::{convert::Infallible, process::Stdio, sync::Arc};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt},
+    io::{AsyncBufReadExt, AsyncRead, BufReader},
     process::Command as TokioCommand,
     sync::mpsc,
 };
@@ -68,16 +68,40 @@ fn lpac_command(args: &[String]) -> TokioCommand {
     command
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, serde::Serialize)]
 struct LpacResponse {
+    #[serde(rename = "type")]
+    event_type: String,
     payload: LpacPayload,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
 struct LpacPayload {
     code: i64,
     message: String,
     data: Value,
+}
+
+// LPAC can emit several progress objects before its final lpa object.
+fn parse_lpac_events(text: &str) -> Vec<LpacResponse> {
+    text.lines()
+        .flat_map(|line| {
+            let start = line.find('{').unwrap_or(line.len());
+            serde_json::Deserializer::from_str(&line[start..])
+                .into_iter::<LpacResponse>()
+                .map_while(Result::ok)
+        })
+        .collect()
+}
+
+fn lpac_failure(payload: &LpacPayload) -> String {
+    let detail = match &payload.data {
+        Value::Null => String::new(),
+        Value::String(value) => value.clone(),
+        value => value.to_string(),
+    };
+    format!("LPAC ({}): {}{}{}", payload.code, payload.message,
+        if detail.is_empty() { "" } else { ": " }, detail)
 }
 
 async fn run_lpac_json(args: &[String]) -> Result<Value, String> {
@@ -89,21 +113,18 @@ async fn run_lpac_json(args: &[String]) -> Result<Value, String> {
     .map_err(|_| "lpac command timed out after 120 seconds".to_string())?
     .map_err(|error| format!("Failed to start lpac: {error}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let json_start = stdout
-        .find('{')
+    let response = parse_lpac_events(&stdout)
+        .into_iter()
+        .filter(|event| event.event_type == "lpa")
+        .last()
         .ok_or_else(|| {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            format!("lpac returned no JSON: {}{}", stdout, stderr)
+            format!("lpac returned no final lpa result: {}{}", stdout, stderr)
         })?;
-    let response: LpacResponse = serde_json::from_str(&stdout[json_start..])
-        .map_err(|error| format!("Invalid lpac response: {error}; output: {stdout}"))?;
 
     if !output.status.success() || response.payload.code != 0 {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "lpac failed ({}): {}{}",
-            response.payload.code, response.payload.message, stderr
-        ));
+        return Err(format!("{} {}", lpac_failure(&response.payload), stderr));
     }
 
     Ok(response.payload.data)
@@ -273,26 +294,130 @@ pub async fn delete_euicc_profile(
     }
 }
 
-async fn forward_lpac_output<R>(mut reader: R, sender: mpsc::Sender<Bytes>)
+pub async fn nickname_euicc_profile(
+    Json(request): Json<EuiccNicknameRequest>,
+) -> Response {
+    if let Err(error) = validate_euicc_identifier(&request.iccid) {
+        return euicc_failure(error);
+    }
+    if request.nickname.chars().count() > 32 || request.nickname.chars().any(char::is_control) {
+        return euicc_failure("昵称最多 32 个字符，且不能包含控制字符");
+    }
+    let args = vec!["profile".into(), "nickname".into(), request.iccid.clone(), request.nickname.clone()];
+    match crate::serial::with_euicc_serial(async { run_lpac_json(&args).await }).await {
+        Ok(_) => Json(ApiResponse::success_with_message("昵称已保存", json!({
+            "iccid": request.iccid, "nickname": request.nickname,
+        }))).into_response(),
+        Err(error) => euicc_failure(error),
+    }
+}
+
+async fn read_euicc_notifications() -> Result<Vec<EuiccNotification>, String> {
+    let data = run_lpac_json(&["notification".into(), "list".into()]).await?;
+    serde_json::from_value(data).map_err(|error| format!("Invalid notification list: {error}"))
+}
+
+pub async fn list_euicc_notifications() -> Response {
+    match crate::serial::with_euicc_serial(read_euicc_notifications()).await {
+        Ok(notifications) => Json(ApiResponse::success_with_message("通知已读取", notifications)).into_response(),
+        Err(error) => euicc_failure(error),
+    }
+}
+
+fn notification_target(request: &EuiccNotificationActionRequest) -> Result<String, String> {
+    match (request.all, request.seq_number) {
+        (true, None) => Ok("-a".into()),
+        (false, Some(seq)) => Ok(seq.to_string()),
+        _ => Err("必须指定一个通知序号，或选择全部通知".into()),
+    }
+}
+
+pub async fn process_euicc_notifications(
+    Json(request): Json<EuiccNotificationActionRequest>,
+) -> Response {
+    let target = match notification_target(&request) {
+        Ok(target) => target,
+        Err(error) => return euicc_failure(error),
+    };
+    let args = vec!["notification".into(), "process".into(), target];
+    match crate::serial::with_euicc_serial(async { run_lpac_json(&args).await }).await {
+        Ok(_) => Json(ApiResponse::success_with_message("通知已发送，记录保留供自行管理", json!({}))).into_response(),
+        Err(error) => euicc_failure(error),
+    }
+}
+
+fn is_safe_notification(notification: &EuiccNotification) -> bool {
+    matches!(notification.profile_management_operation.as_str(), "enable" | "disable")
+}
+
+pub async fn remove_euicc_notifications(
+    Json(request): Json<EuiccNotificationActionRequest>,
+) -> Response {
+    if let Err(error) = notification_target(&request) {
+        return euicc_failure(error);
+    }
+    let result = crate::serial::with_euicc_serial(async {
+        // Read and remove under the same serial lock. Never use remove -a:
+        // it would also delete operator notifications that must be preserved.
+        let notifications = read_euicc_notifications().await?;
+        let mut skipped = 0;
+        let targets: Vec<_> = if request.all {
+            notifications.into_iter().filter(|notification| {
+                if is_safe_notification(notification) { true } else { skipped += 1; false }
+            }).collect()
+        } else {
+            let notification = notifications.into_iter()
+                .find(|notification| Some(notification.seq_number) == request.seq_number)
+                .ok_or_else(|| "通知已不存在，请刷新列表".to_string())?;
+            if !is_safe_notification(&notification) && !request.confirm_sensitive {
+                return Err(format!("删除 {} 通知需要再次确认", notification.profile_management_operation));
+            }
+            vec![notification]
+        };
+        let mut removed = Vec::new();
+        let mut failed = Vec::new();
+        for notification in targets {
+            let args = vec!["notification".into(), "remove".into(), notification.seq_number.to_string()];
+            match run_lpac_json(&args).await {
+                Ok(_) => removed.push(notification.seq_number),
+                Err(error) => failed.push(json!({ "seqNumber": notification.seq_number, "message": error })),
+            }
+        }
+        Ok(json!({ "removed": removed, "failed": failed, "skipped": skipped }))
+    }).await;
+    match result {
+        Ok(summary) => Json(ApiResponse::success_with_message("通知删除操作已完成", summary)).into_response(),
+        Err(error) => euicc_failure(error),
+    }
+}
+
+async fn forward_lpac_output<R>(reader: R, sender: mpsc::Sender<Bytes>, parse_events: bool)
+    -> std::io::Result<Option<LpacPayload>>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    let mut buffer = [0_u8; 2048];
+    let mut reader = BufReader::new(reader);
+    let mut buffer = Vec::new();
+    let mut result = None;
     loop {
-        let read = match reader.read(&mut buffer).await {
-            Ok(0) | Err(_) => break,
-            Ok(read) => read,
-        };
+        buffer.clear();
+        if reader.read_until(b'\n', &mut buffer).await? == 0 { break; }
+        // Decode complete lines so UTF-8 characters split across OS reads survive.
+        let text = String::from_utf8_lossy(&buffer);
         let event = json!({
             "type": "output",
-            "text": String::from_utf8_lossy(&buffer[..read]),
+            "text": text,
         });
-        let mut line = event.to_string();
-        line.push('\n');
-        if sender.send(Bytes::from(line)).await.is_err() {
-            break;
+        let _ = sender.send(Bytes::from(format!("{event}\n"))).await;
+        if parse_events {
+            for event in parse_lpac_events(&text) {
+                if event.event_type == "lpa" { result = Some(event.payload.clone()); }
+                let event = json!({ "type": "lpac", "event": event });
+                let _ = sender.send(Bytes::from(format!("{event}\n"))).await;
+            }
         }
     }
+    Ok(result)
 }
 
 /// POST /api/euicc/profile/download - 下载 Profile 并流式返回 lpac 输出
@@ -363,21 +488,28 @@ pub async fn download_euicc_profile(
             let stdout_task = tokio::spawn(forward_lpac_output(
                 child.stdout.take().expect("stdout is piped"),
                 sender.clone(),
+                true,
             ));
             let stderr_task = tokio::spawn(forward_lpac_output(
                 child.stderr.take().expect("stderr is piped"),
                 sender.clone(),
+                false,
             ));
             let status = child.wait().await;
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
+            let stdout = stdout_task.await;
+            let stderr = stderr_task.await;
+            let streams_ok = matches!(&stdout, Ok(Ok(_))) && matches!(&stderr, Ok(Ok(_)));
+            let result = stdout.ok().and_then(Result::ok).flatten();
 
-            let (success, message) = match status {
-                Ok(status) if status.success() => (true, "LPAC download completed"),
-                Ok(_) => (false, "LPAC download failed"),
-                Err(_) => (false, "Failed to wait for LPAC download"),
+            let success = matches!(status, Ok(status) if status.success())
+                && streams_ok && result.as_ref().is_some_and(|payload| payload.code == 0);
+            let message = match &result {
+                Some(payload) if payload.code != 0 => lpac_failure(payload),
+                _ if success => "eSIM 配置文件下载成功".to_string(),
+                None => "LPAC 未返回最终下载结果".to_string(),
+                _ => "LPAC 下载进程异常结束".to_string(),
             };
-            let event = json!({ "type": "complete", "success": success, "message": message });
+            let event = json!({ "type": "complete", "success": success, "message": message, "result": result });
             let mut line = event.to_string();
             line.push('\n');
             let _ = sender.send(Bytes::from(line)).await;

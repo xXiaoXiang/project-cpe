@@ -248,6 +248,30 @@ pub struct EuiccProfileRequest {
     pub iccid: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct EuiccNicknameRequest {
+    pub iccid: String,
+    pub nickname: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EuiccNotification {
+    pub seq_number: u32,
+    pub profile_management_operation: String,
+    pub iccid: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EuiccNotificationActionRequest {
+    pub seq_number: Option<u32>,
+    #[serde(default)]
+    pub all: bool,
+    #[serde(default)]
+    pub confirm_sensitive: bool,
+}
+
 /// 下载 eUICC Profile 请求
 #[derive(Debug, Deserialize)]
 pub struct EuiccDownloadRequest {

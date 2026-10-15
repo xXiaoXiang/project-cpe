@@ -15,6 +15,7 @@ import { Box, type Theme, useMediaQuery, useTheme } from '@mui/material'
 import { api } from '../../api'
 import { RefreshContext } from '../../contexts/RefreshContext'
 import { usePageVisibility } from '../../hooks/useAdaptivePolling'
+import { useSingleFlight } from '../../hooks/useSingleFlight'
 import Sidebar from './Sidebar'
 import TopBar from './TopBar'
 
@@ -38,6 +39,7 @@ function getHeartbeatInterval(refreshInterval: number, isPageVisible: boolean) {
 }
 
 export default function MainLayout() {
+  const run = useSingleFlight()
   const theme = useTheme<Theme>()
   const isMobile = useMediaQuery(theme.breakpoints.down('sm'))
   const isPageVisible = usePageVisibility()
@@ -76,7 +78,7 @@ export default function MainLayout() {
   useEffect(() => {
     let cancelled = false
 
-    const sendHeartbeat = async () => {
+    const sendHeartbeat = () => run('heartbeat', async () => {
       try {
         await api.sendRefreshHeartbeat()
       } catch (error) {
@@ -84,7 +86,7 @@ export default function MainLayout() {
           console.warn('刷新心跳发送失败:', error)
         }
       }
-    }
+    })
 
     void sendHeartbeat()
 
@@ -96,7 +98,7 @@ export default function MainLayout() {
       cancelled = true
       window.clearInterval(timer)
     }
-  }, [isPageVisible, refreshInterval])
+  }, [isPageVisible, refreshInterval, run])
 
   const handleDrawerToggle = () => {
     if (isMobile) {

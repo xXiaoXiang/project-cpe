@@ -71,6 +71,9 @@ import {
 import Grid from '@mui/material/Grid'
 import { api, type RadioMode, type BandLockStatus, type BandLockRequest } from '../api'
 import { useRefreshInterval } from '../contexts/RefreshContext'
+import { useApiRequests } from '../hooks/useApiRequests'
+import { useAdaptivePolling } from '../hooks/useAdaptivePolling'
+import { useSingleFlight } from '../hooks/useSingleFlight'
 import { useRevealAll } from '../contexts/revealSensitive'
 import ErrorSnackbar from '../components/ErrorSnackbar'
 import type { CellsResponse, OperatorListResponse, CellLocationResponse, CellLockStatusResponse, NetworkInterfaceInfo, IpAddress, ApnContext } from '../api/types'
@@ -104,8 +107,8 @@ function TabPanel(props: TabPanelProps) {
 
 export default function NetworkPage() {
   const { refreshInterval, refreshKey } = useRefreshInterval()
-  const [initialLoading, setInitialLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const { initialLoading, error, setError, fetchInto } = useApiRequests()
+  const run = useSingleFlight()
   const [success, setSuccess] = useState<string | null>(null)
   const [tabValue, setTabValue] = useState(0)
   
@@ -155,80 +158,64 @@ export default function NetworkPage() {
   const [bandConfigRefreshing, setBandConfigRefreshing] = useState(false)
 
   // 加载频段锁定配置（只在首次加载和手动刷新时调用，自动刷新不调用）
-  const loadBandLockConfig = useCallback(async () => {
+  const loadBandLockConfig = useCallback(() => run('band-config', async () => {
     try {
       setBandConfigRefreshing(true)
-      const [radioModeRes, bandLockRes] = await Promise.all([
-        api.getRadioMode(),
-        api.getBandLockStatus(),
+      await Promise.allSettled([
+        fetchInto('radio', '网络模式', () => api.getRadioMode(), (data) => {
+          const mode = data.mode
+          if (mode === 'auto' || mode === 'lte' || mode === 'nr') {
+            setCurrentRadioMode(mode as RadioMode)
+          }
+        }),
+        fetchInto('bands', '频段配置', () => api.getBandLockStatus(), (data) => {
+          setBandLockStatus(data)
+
+          // 根据后端返回判断锁定模式
+          // 后端逻辑：未锁定时返回空数组，已锁定时返回具体频段
+          const isLocked = data.locked
+          const hasAnyBands = data.lte_fdd_bands.length > 0
+                           || data.lte_tdd_bands.length > 0
+                           || data.nr_fdd_bands.length > 0
+                           || data.nr_tdd_bands.length > 0
+
+          if (!isLocked || !hasAnyBands) {
+            // 未锁定模式
+            setLockMode('unlocked')
+            setLteFddBands([])
+            setLteTddBands([])
+            setNrFddBands([])
+            setNrTddBands([])
+          } else {
+            // 自定义锁定模式
+            setLockMode('custom')
+            setLteFddBands(data.lte_fdd_bands)
+            setLteTddBands(data.lte_tdd_bands)
+            setNrFddBands(data.nr_fdd_bands)
+            setNrTddBands(data.nr_tdd_bands)
+          }
+        }),
       ])
-      
-      if (radioModeRes.data) {
-        const mode = radioModeRes.data.mode
-        if (mode === 'auto' || mode === 'lte' || mode === 'nr') {
-          setCurrentRadioMode(mode as RadioMode)
-        }
-      }
-      
-      if (bandLockRes.data) {
-        setBandLockStatus(bandLockRes.data)
-        
-        // 根据后端返回判断锁定模式
-        // 后端逻辑：未锁定时返回空数组，已锁定时返回具体频段
-        const isLocked = bandLockRes.data.locked
-        const hasAnyBands = bandLockRes.data.lte_fdd_bands.length > 0 
-                         || bandLockRes.data.lte_tdd_bands.length > 0
-                         || bandLockRes.data.nr_fdd_bands.length > 0
-                         || bandLockRes.data.nr_tdd_bands.length > 0
-        
-        if (!isLocked || !hasAnyBands) {
-          // 未锁定模式
-          setLockMode('unlocked')
-          setLteFddBands([])
-          setLteTddBands([])
-          setNrFddBands([])
-          setNrTddBands([])
-        } else {
-          // 自定义锁定模式
-          setLockMode('custom')
-          setLteFddBands(bandLockRes.data.lte_fdd_bands)
-          setLteTddBands(bandLockRes.data.lte_tdd_bands)
-          setNrFddBands(bandLockRes.data.nr_fdd_bands)
-          setNrTddBands(bandLockRes.data.nr_tdd_bands)
-        }
-      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
       setBandConfigRefreshing(false)
     }
-  }, [])
+  }), [fetchInto, run, setError])
 
   // 加载其他数据（自动刷新时调用，不包含频段锁定配置）
   const loadData = useCallback(async () => {
-    setError(null)
-    
-    try {
-      const [cellsRes, operatorsRes, cellLocRes, cellLockRes, interfacesRes, apnRes] = await Promise.all([
-        api.getCellsInfo(),
-        api.getOperators(),
-        api.getCellLocationInfo(),
-        api.getCellLockStatus(),
-        api.getNetworkInterfaces(),
-        api.getApnList(),
-      ])
-      
-      if (cellsRes.data) setCellsInfo(cellsRes.data)
-      if (operatorsRes.data) setOperators(operatorsRes.data)
-      if (cellLocRes.data) setCellLocation(cellLocRes.data)
-      if (cellLockRes.data) setCellLockStatus(cellLockRes.data)
-      if (interfacesRes.data) setInterfaces(interfacesRes.data.interfaces)
-      
-      if (apnRes.data?.contexts) {
-        setApnContexts(apnRes.data.contexts)
+    await Promise.allSettled([
+      fetchInto('cells', '小区信息', () => api.getCellsInfo(), setCellsInfo),
+      fetchInto('operators', '运营商', () => api.getOperators(), setOperators),
+      fetchInto('location', '小区位置', () => api.getCellLocationInfo(), setCellLocation),
+      fetchInto('cell-lock', '锁小区状态', () => api.getCellLockStatus(), setCellLockStatus),
+      fetchInto('interfaces', '网络接口', () => api.getNetworkInterfaces(), (data) => setInterfaces(data.interfaces)),
+      fetchInto('apn', 'APN 配置', () => api.getApnList(), (data) => {
+        setApnContexts(data.contexts)
         // 只在首次加载时初始化 APN 表单，避免覆盖用户输入
         if (!apnInitializedRef.current) {
-          const activeContext = apnRes.data.contexts.find(c => c.apn) || apnRes.data.contexts[0]
+          const activeContext = data.contexts.find(c => c.apn) || data.contexts[0]
           if (activeContext) {
             setSelectedContext(activeContext.path)
             setApnForm({
@@ -241,21 +228,9 @@ export default function NetworkPage() {
           }
           apnInitializedRef.current = true
         }
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setInitialLoading(false)
-    }
-  }, [])
-
-  // 首次加载：加载所有数据（包括频段配置）
-  const loadAllData = useCallback(async () => {
-    await Promise.all([
-      loadData(),
-      loadBandLockConfig(),
+      }),
     ])
-  }, [loadBandLockConfig, loadData])
+  }, [fetchInto])
 
   // 手动刷新频段配置
   const handleRefreshBandConfig = () => {
@@ -608,17 +583,11 @@ export default function NetworkPage() {
     : interfaces.filter((iface) => iface.status.toLowerCase() !== 'down')
 
   useEffect(() => {
-    // 首次加载：加载所有数据（包括频段配置）
-    void loadAllData()
-    
-    // 自动刷新：只刷新小区、运营商等数据，不刷新频段配置（避免覆盖用户选择）
-    if (refreshInterval > 0) {
-      const interval = setInterval(() => {
-        void loadData()
-      }, refreshInterval)
-      return () => clearInterval(interval)
-    }
-  }, [loadAllData, loadData, refreshInterval, refreshKey])
+    void loadBandLockConfig()
+  }, [loadBandLockConfig, refreshKey])
+
+  // 自动刷新不覆盖用户正在编辑的频段配置。
+  useAdaptivePolling({ refreshInterval, refreshKey, onTick: loadData })
 
   const handleTabChange = (_event: React.SyntheticEvent, newValue: number) => {
     setTabValue(newValue)

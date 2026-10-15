@@ -46,9 +46,11 @@ import {
   RestartAlt,
 } from '@mui/icons-material'
 import { api } from '../api'
+import { useSingleFlight } from '../hooks/useSingleFlight'
 import type { OtaStatusResponse, OtaUploadResponse } from '../api/types'
 
 export default function OtaUpdate() {
+  const run = useSingleFlight()
   const [loading, setLoading] = useState(true)
   const [uploading, setUploading] = useState(false)
   const [applying, setApplying] = useState(false)
@@ -61,7 +63,7 @@ export default function OtaUpdate() {
   
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  const loadStatus = useCallback(async () => {
+  const loadStatus = useCallback(() => run('status', async () => {
     try {
       const res = await api.getOtaStatus()
       if (res.data) {
@@ -72,7 +74,7 @@ export default function OtaUpdate() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }), [run])
 
   useEffect(() => {
     void loadStatus()

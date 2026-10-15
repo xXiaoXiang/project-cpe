@@ -8,7 +8,7 @@
  * 
  * Copyright (c) 2025 by 1orz, All Rights Reserved. 
  */
-import { useState, useEffect, useRef, useCallback, type ChangeEvent, type KeyboardEvent } from 'react'
+import { useState, useRef, useCallback, type ChangeEvent, type KeyboardEvent } from 'react'
 import {
   Box,
   Card,
@@ -47,6 +47,8 @@ import {
 } from '@mui/icons-material'
 import { api, type SmsMessage, type SmsStats } from '../api'
 import { useRefreshInterval } from '../contexts/RefreshContext'
+import { useAdaptivePolling } from '../hooks/useAdaptivePolling'
+import { useSingleFlight } from '../hooks/useSingleFlight'
 
 interface ConversationGroup {
   phoneNumber: string
@@ -58,6 +60,8 @@ interface ConversationGroup {
 export default function SMSPage() {
   const isMobile = useMediaQuery<Theme>((theme: Theme) => theme.breakpoints.down('md'))
   const { refreshInterval, refreshKey } = useRefreshInterval()
+  const run = useSingleFlight()
+  const selectedConversationRef = useRef<string | null>(null)
   
   const [messages, setMessages] = useState<SmsMessage[]>([])
   const [stats, setStats] = useState<SmsStats | null>(null)
@@ -88,7 +92,7 @@ export default function SMSPage() {
   }, [])
 
   // 获取短信列表
-  const fetchMessages = useCallback(async () => {
+  const fetchMessages = useCallback(() => run('messages', async () => {
     setLoading(true)
     setError(null)
     try {
@@ -104,7 +108,7 @@ export default function SMSPage() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }), [run])
 
   // 按联系人分组对话
   const groupConversations = (msgs: SmsMessage[]) => {
@@ -137,10 +141,12 @@ export default function SMSPage() {
   }
 
   // 获取对话历史
-  const fetchConversation = useCallback(async (phone: string) => {
+  const fetchConversation = useCallback((phone: string) => run(`conversation:${phone}`, async () => {
+    if (selectedConversationRef.current !== phone) return
     setConversationLoading(true)
     try {
       const response = await api.getSmsConversation({ phone_number: phone })
+      if (selectedConversationRef.current !== phone) return
       if (response.status === 'ok' && response.data) {
         const sorted = [...response.data].sort((a, b) => 
           new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
@@ -149,6 +155,7 @@ export default function SMSPage() {
         setTimeout(scrollToBottom, 100)
       }
     } catch {
+      if (selectedConversationRef.current !== phone) return
       const localMsgs = messages.filter(m => m.phone_number === phone)
       const sorted = [...localMsgs].sort((a, b) => 
         new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
@@ -156,12 +163,12 @@ export default function SMSPage() {
       setConversationMessages(sorted)
       setTimeout(scrollToBottom, 100)
     } finally {
-      setConversationLoading(false)
+      if (selectedConversationRef.current === phone) setConversationLoading(false)
     }
-  }, [messages, scrollToBottom])
+  }), [messages, run, scrollToBottom])
 
   // 获取统计信息
-  const fetchStats = useCallback(async () => {
+  const fetchStats = useCallback(() => run('stats', async () => {
     try {
       const response = await api.getSmsStats()
       if (response.status === 'ok' && response.data) {
@@ -170,28 +177,20 @@ export default function SMSPage() {
     } catch (err) {
       console.error('获取短信统计失败:', err)
     }
-  }, [])
+  }), [run])
 
-  useEffect(() => {
-    void fetchMessages()
-    void fetchStats()
-    if (refreshInterval <= 0) {
-      return undefined
-    }
-
-    const interval = window.setInterval(() => {
-      // 输入框有焦点时跳过刷新，避免失焦问题
-      if (inputFocusedRef.current) {
-        return
-      }
-      void fetchMessages()
-      void fetchStats()
-    }, refreshInterval)
-    return () => window.clearInterval(interval)
-  }, [fetchMessages, fetchStats, refreshInterval, refreshKey])
+  useAdaptivePolling({
+    refreshInterval,
+    refreshKey,
+    onTick: async () => {
+      if (inputFocusedRef.current) return
+      await Promise.allSettled([fetchMessages(), fetchStats()])
+    },
+  })
 
   // 选择对话
   const handleSelectConversation = (phone: string) => {
+    selectedConversationRef.current = phone
     setSelectedConversation(phone)
     setPhoneNumber(phone)
     void fetchConversation(phone)
@@ -199,6 +198,8 @@ export default function SMSPage() {
 
   // 返回对话列表
   const handleBackToList = () => {
+    selectedConversationRef.current = null
+    setConversationLoading(false)
     setSelectedConversation(null)
     setConversationMessages([])
   }
@@ -210,6 +211,8 @@ export default function SMSPage() {
       return
     }
     setNewChatDialogOpen(false)
+    selectedConversationRef.current = newChatNumber
+    setConversationLoading(false)
     setSelectedConversation(newChatNumber)
     setPhoneNumber(newChatNumber)
     setConversationMessages([])
@@ -265,6 +268,8 @@ export default function SMSPage() {
         setSuccess('所有短信已清空')
         setMessages([])
         setConversations([])
+        selectedConversationRef.current = null
+        setConversationLoading(false)
         setSelectedConversation(null)
         void fetchStats()
       } else {

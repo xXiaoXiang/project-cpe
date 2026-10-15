@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { useSingleFlight } from '../hooks/useSingleFlight'
 import {
   Alert,
   Box,
   Button,
   Card,
-  CardActions,
   CardContent,
   Chip,
   CircularProgress,
@@ -22,7 +22,13 @@ import {
 } from '@mui/material'
 import {
   DeleteOutline,
+  Check,
+  CheckCircleOutline,
+  Close,
   Download,
+  EditOutlined,
+  ErrorOutline,
+  NotificationsNone,
   PowerSettingsNew,
   Refresh,
   SimCardDownload,
@@ -30,6 +36,8 @@ import {
 } from '@mui/icons-material'
 import { api } from '@/api'
 import type { EuiccDownloadRequest, EuiccInfo, EuiccProfile } from '@/api/types'
+import EuiccNotificationsDialog from '../components/EuiccNotificationsDialog'
+import { advanceDownload, downloadedIccid, downloadFailure, downloadSteps, type DownloadProgress } from '../utils/euiccDownload'
 
 interface ProfileAction {
   type: 'enable' | 'delete'
@@ -49,6 +57,8 @@ const emptyDownloadRequest: EuiccDownloadRequest = {
   imei: '',
 }
 
+const profileName = (profile: EuiccProfile) => profile.profileName || profile.serviceProviderName || profile.iccid
+
 export default function EuiccManagementPage() {
   const [euicc, setEuicc] = useState<EuiccInfo | null>(null)
   const [loading, setLoading] = useState(true)
@@ -64,10 +74,17 @@ export default function EuiccManagementPage() {
   const [downloadRunning, setDownloadRunning] = useState(false)
   const [downloadFinished, setDownloadFinished] = useState(false)
   const [downloadOutput, setDownloadOutput] = useState('')
+  const [showRawOutput, setShowRawOutput] = useState(false)
+  const [downloadProgress, setDownloadProgress] = useState<DownloadProgress>({ step: 0 })
+  const [nicknameEdit, setNicknameEdit] = useState<{ iccid: string; value: string } | null>(null)
+  const [nicknameBusy, setNicknameBusy] = useState(false)
+  const [nicknameError, setNicknameError] = useState<string | null>(null)
+  const [notificationsOpen, setNotificationsOpen] = useState(false)
   const [notice, setNotice] = useState<Notice | null>(null)
   const outputRef = useRef<HTMLPreElement | null>(null)
 
-  const loadEuicc = useCallback(async () => {
+  const run = useSingleFlight()
+  const loadEuicc = useCallback(() => run('euicc', async () => {
     setLoading(true)
     setLoadError(null)
     try {
@@ -82,7 +99,7 @@ export default function EuiccManagementPage() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }), [run])
 
   useEffect(() => {
     void loadEuicc()
@@ -92,7 +109,7 @@ export default function EuiccManagementPage() {
     if (outputRef.current) {
       outputRef.current.scrollTop = outputRef.current.scrollHeight
     }
-  }, [downloadOutput])
+  }, [downloadOutput, showRawOutput])
 
   const runProfileAction = async () => {
     if (!pendingAction) return
@@ -148,25 +165,56 @@ export default function EuiccManagementPage() {
     setDownloadRequest((current) => ({ ...current, [field]: value }))
   }
 
+  const saveNickname = async () => {
+    if (!nicknameEdit || nicknameBusy) return
+    if (Array.from(nicknameEdit.value).length > 32) {
+      setNicknameError('昵称最多 32 个字符')
+      return
+    }
+    const { iccid, value } = nicknameEdit
+    setNicknameBusy(true)
+    setNicknameError(null)
+    try {
+      const response = await api.setEuiccNickname(iccid, value)
+      if (response.status !== 'ok' || !response.data) throw new Error(response.message || '保存昵称失败')
+      const nickname = response.data.nickname
+      setEuicc((current) => current ? { ...current, profiles: current.profiles.map((profile) =>
+        profile.iccid === iccid ? { ...profile, profileNickname: nickname || null } : profile) } : current)
+      setNicknameEdit(null)
+      setNotice({ severity: 'success', text: '昵称已保存' })
+    } catch (error) {
+      setNicknameError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setNicknameBusy(false)
+    }
+  }
+
   const startDownload = async () => {
+    if (downloadRunning) return
     setDownloadError(null)
     setDownloadOutput('')
+    setShowRawOutput(false)
+    setDownloadProgress({ step: 0 })
     setDownloadFinished(false)
     setDownloadRunning(true)
     setDownloadOpen(false)
     setDownloadOpenOutput(true)
 
     try {
-      await api.downloadEuiccProfile(downloadRequest, (chunk) => {
+      const result = await api.downloadEuiccProfile(downloadRequest, (chunk) => {
         setDownloadOutput((current) => current + chunk)
+      }, (event) => {
+        setDownloadProgress((current) => advanceDownload(current, event))
       })
+      setDownloadProgress((current) => advanceDownload(current, { type: 'lpa', payload: result }))
       setDownloadFinished(true)
-      setNotice({ severity: 'success', text: 'LPAC 下载命令已完成' })
-      await loadEuicc()
+      setNotice({ severity: 'success', text: 'eSIM 配置文件下载成功' })
     } catch (error) {
       setDownloadError(error instanceof Error ? error.message : String(error))
     } finally {
       setDownloadRunning(false)
+      // A lost stream may still have installed the profile; read the actual card state.
+      void loadEuicc()
     }
   }
 
@@ -179,12 +227,19 @@ export default function EuiccManagementPage() {
   const canStartDownload = hasActivationCode || Boolean(
     downloadRequest.smdp_address?.trim() && downloadRequest.matching_id?.trim()
   )
+  const deviceBusy = actionBusy || nicknameBusy || downloadRunning || refreshSimBusy
+  const nicknameLength = Array.from(nicknameEdit?.value || '').length
+  const downloadSucceeded = downloadFinished && !downloadError
+  const downloadIccid = downloadedIccid(downloadProgress)
+  const downloadErrorText = downloadError ? downloadFailure(downloadProgress.result, downloadError) : null
+  const activeProfile = euicc?.profiles.find((profile) =>
+    profile.profileState.toLowerCase() === 'enabled' && profile.iccid !== pendingAction?.profile.iccid)
 
   return (
     <Box sx={{ p: { xs: 2, md: 3 }, maxWidth: 1200, mx: 'auto' }}>
       <Stack
-        direction={{ xs: 'column', sm: 'row' }}
-        alignItems={{ xs: 'stretch', sm: 'center' }}
+        direction={{ xs: 'column', lg: 'row' }}
+        alignItems={{ xs: 'stretch', lg: 'center' }}
         justifyContent="space-between"
         spacing={2}
         sx={{ mb: 2.5 }}
@@ -200,14 +255,14 @@ export default function EuiccManagementPage() {
             </Typography>
           )}
         </Box>
-        <Stack direction="row" spacing={1} justifyContent={{ xs: 'flex-end', sm: 'initial' }}>
+        <Stack direction="row" useFlexGap flexWrap="wrap" spacing={1} justifyContent={{ xs: 'flex-start', lg: 'flex-end' }}>
           <Tooltip title="重新读取 eUICC 和 Profile">
             <span>
               <Button
                 variant="outlined"
                 startIcon={loading ? <CircularProgress size={16} /> : <Refresh />}
                 onClick={() => void loadEuicc()}
-                disabled={loading || euiccUnavailable}
+                disabled={loading || euiccUnavailable || deviceBusy}
               >
                 刷新
               </Button>
@@ -218,9 +273,13 @@ export default function EuiccManagementPage() {
             color="warning"
             startIcon={<Sync />}
             onClick={() => setRefreshSimOpen(true)}
-            disabled={!euicc || loading}
+            disabled={!euicc || loading || deviceBusy}
           >
             强制刷新 eUICC SIM
+          </Button>
+          <Button variant="outlined" startIcon={<NotificationsNone />}
+            onClick={() => setNotificationsOpen(true)} disabled={!euicc || loading || deviceBusy}>
+            通知管理
           </Button>
           <Button
             variant="contained"
@@ -229,7 +288,7 @@ export default function EuiccManagementPage() {
               setDownloadError(null)
               setDownloadOpen(true)
             }}
-            disabled={!euicc || loading}
+            disabled={!euicc || loading || deviceBusy}
           >
             下载 Profile
           </Button>
@@ -261,21 +320,33 @@ export default function EuiccManagementPage() {
           sx={{
             display: 'grid',
             gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 320px), 1fr))',
+            alignItems: 'start',
             gap: 2,
           }}
         >
           {euicc.profiles.map((profile) => {
             const enabled = profile.profileState.toLowerCase() === 'enabled'
-            const name = profile.profileNickname || profile.profileName || profile.serviceProviderName || '未命名 Profile'
+            const name = profile.profileName || profile.serviceProviderName || '未命名 Profile'
             const provider = profile.serviceProviderName || profile.profileName
+            const editing = nicknameEdit?.iccid === profile.iccid
             return (
               <Card key={profile.iccid} variant="outlined" sx={{ borderRadius: 1, display: 'flex', flexDirection: 'column' }}>
-                <CardContent sx={{ flexGrow: 1 }}>
+                <CardContent sx={{ p: 2, '&:last-child': { pb: 2 } }}>
                   <Stack direction="row" justifyContent="space-between" alignItems="flex-start" spacing={1}>
                     <Box sx={{ minWidth: 0 }}>
-                      <Typography variant="h6" component="h2" sx={{ overflowWrap: 'anywhere' }}>
-                        {name}
-                      </Typography>
+                      <Stack direction="row" alignItems="baseline" gap={0.75} flexWrap="wrap">
+                        <Typography variant="h6" component="h2" sx={{ overflowWrap: 'anywhere' }}>{name}</Typography>
+                        {!editing && profile.profileNickname && (
+                          <Typography variant="body2" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>{profile.profileNickname}</Typography>
+                        )}
+                        {!editing && <Tooltip title="编辑昵称"><span>
+                          <IconButton size="small" aria-label={`编辑 ${name} 的昵称`} disabled={deviceBusy}
+                            onClick={() => {
+                              setNicknameEdit({ iccid: profile.iccid, value: profile.profileNickname || '' })
+                              setNicknameError(null)
+                            }}><EditOutlined fontSize="small" /></IconButton>
+                        </span></Tooltip>}
+                      </Stack>
                       {provider && provider !== name && (
                         <Typography variant="body2" color="text.secondary" sx={{ mt: 0.25 }}>
                           {provider}
@@ -289,7 +360,25 @@ export default function EuiccManagementPage() {
                       variant={enabled ? 'filled' : 'outlined'}
                     />
                   </Stack>
-                  <Stack spacing={0.75} sx={{ mt: 2 }}>
+                  {editing && nicknameEdit && (
+                    <Box component="form" onSubmit={(event) => { event.preventDefault(); void saveNickname() }} sx={{ mt: 1.5 }}>
+                      <Stack direction="row" alignItems="flex-start" spacing={0.5}>
+                        <TextField autoFocus size="small" label="昵称" fullWidth value={nicknameEdit.value}
+                          disabled={nicknameBusy} error={nicknameLength > 32 || Boolean(nicknameError)}
+                          helperText={nicknameError || `${nicknameLength}/32 字符，留空可清除昵称`}
+                          onChange={(event) => {
+                            setNicknameEdit({ iccid: profile.iccid, value: event.target.value })
+                            setNicknameError(null)
+                          }} />
+                        <IconButton type="submit" color="primary" aria-label="保存昵称" disabled={nicknameBusy || nicknameLength > 32}>
+                          {nicknameBusy ? <CircularProgress size={20} /> : <Check />}
+                        </IconButton>
+                        <IconButton aria-label="取消编辑昵称" disabled={nicknameBusy} onClick={() => setNicknameEdit(null)}><Close /></IconButton>
+                      </Stack>
+                    </Box>
+                  )}
+                  <Stack direction="row" alignItems="center" spacing={1.5} sx={{ mt: 1.5 }}>
+                    <Stack spacing={0.75} sx={{ flex: 1, minWidth: 0 }}>
                     <Typography variant="caption" color="text.secondary">ICCID</Typography>
                     <Typography variant="body2" sx={{ fontFamily: 'monospace', overflowWrap: 'anywhere' }}>
                       {profile.iccid}
@@ -299,30 +388,19 @@ export default function EuiccManagementPage() {
                         类型：{profile.profileClass}
                       </Typography>
                     )}
+                    </Stack>
+                    <Stack spacing={0.5} sx={{ flexShrink: 0 }}>
+                      <Button size="small" startIcon={<PowerSettingsNew />} aria-label={`启用 ${name}`}
+                        onClick={() => setPendingAction({ type: 'enable', profile })} disabled={enabled || deviceBusy}>
+                        启用
+                      </Button>
+                      <Button size="small" startIcon={<DeleteOutline />} aria-label={`删除 ${name}`} color="error"
+                        onClick={() => setPendingAction({ type: 'delete', profile })} disabled={deviceBusy}>
+                        删除
+                      </Button>
+                    </Stack>
                   </Stack>
                 </CardContent>
-                <CardActions sx={{ justifyContent: 'flex-end', px: 2, pb: 1.5 }}>
-                  <Button
-                    size="small"
-                    startIcon={<PowerSettingsNew />}
-                    onClick={() => setPendingAction({ type: 'enable', profile })}
-                    disabled={enabled || actionBusy}
-                  >
-                    启用
-                  </Button>
-                  <Tooltip title={`删除 ${name}`}>
-                    <span>
-                      <IconButton
-                        aria-label={`删除 ${name}`}
-                        color="error"
-                        onClick={() => setPendingAction({ type: 'delete', profile })}
-                        disabled={actionBusy}
-                      >
-                        <DeleteOutline />
-                      </IconButton>
-                    </span>
-                  </Tooltip>
-                </CardActions>
               </Card>
             )
           })}
@@ -331,20 +409,23 @@ export default function EuiccManagementPage() {
         <Alert severity="info">eUICC 已就绪，当前没有已安装的 Profile。</Alert>
       ) : null}
 
+      {notificationsOpen && <EuiccNotificationsDialog onClose={() => setNotificationsOpen(false)} />}
+
       <Dialog open={pendingAction !== null} onClose={() => !actionBusy && setPendingAction(null)}>
         <DialogTitle>{pendingAction?.type === 'delete' ? '确认删除 Profile' : '确认启用 Profile'}</DialogTitle>
         <DialogContent>
           <DialogContentText>
-            {pendingAction && (
+            {pendingAction?.type === 'enable' ? (
+              activeProfile
+                ? `启用${profileName(pendingAction.profile)}会关闭${profileName(activeProfile)}，确认是否继续？`
+                : `启用${profileName(pendingAction.profile)}，确认是否继续？`
+            ) : pendingAction && (
               <>
-                {pendingAction.type === 'delete'
-                  ? '此操作不可撤销，将删除：'
-                  : '将启用：'}
+                此操作不可撤销，将删除：
                 <Box component="span" sx={{ display: 'block', mt: 1, fontWeight: 600, color: 'text.primary', overflowWrap: 'anywhere' }}>
                   {pendingAction.profile.profileNickname || pendingAction.profile.profileName || pendingAction.profile.iccid}
                   {' · '}{pendingAction.profile.iccid}
                 </Box>
-                {pendingAction.type === 'enable' && '蜂窝连接可能暂时中断。'}
               </>
             )}
           </DialogContentText>
@@ -441,14 +522,45 @@ export default function EuiccManagementPage() {
         </DialogActions>
       </Dialog>
 
-      <Dialog open={downloadOpenOutput} onClose={closeDownloadOutput} fullWidth maxWidth="md">
-        <DialogTitle>LPAC 下载输出</DialogTitle>
+      <Dialog open={downloadOpenOutput} onClose={closeDownloadOutput} fullWidth maxWidth="sm">
+        <DialogTitle>下载 eSIM 配置文件</DialogTitle>
         <DialogContent>
           <Stack spacing={1.5}>
-            {downloadRunning && <Alert severity="info">LPAC 正在运行，输出会实时追加。</Alert>}
-            {downloadError && <Alert severity="error">{downloadError}</Alert>}
-            {downloadFinished && !downloadError && <Alert severity="success">命令已结束。</Alert>}
-            <Box
+            <Typography role="status" aria-live="polite" color="text.secondary">
+              {downloadRunning ? '正在下载您的 eSIM…' : downloadSucceeded ? 'eSIM 配置文件下载成功' : '下载未完成'}
+            </Typography>
+            <Box role="list" aria-label="eSIM 下载进度">
+              {downloadSteps.map((label, index) => {
+                const complete = downloadSucceeded || index < downloadProgress.step
+                const active = !downloadSucceeded && index === downloadProgress.step
+                const failed = active && Boolean(downloadError)
+                const status = complete ? '已完成' : failed ? '失败' : active ? '进行中' : '等待中'
+                return (
+                  <Stack key={label} role="listitem" aria-label={`${label}：${status}`} aria-current={active ? 'step' : undefined}
+                    direction="row" alignItems="center" justifyContent="space-between" spacing={2}
+                    sx={{ py: 2.25, borderBottom: 1, borderColor: 'divider', color: failed ? 'error.main' : complete || active ? 'text.primary' : 'text.disabled' }}>
+                    <Typography>{label}</Typography>
+                    {complete ? <CheckCircleOutline color="success" /> : failed ? <ErrorOutline color="error" />
+                      : active && downloadRunning ? <CircularProgress size={24} />
+                        : <Box sx={{ width: 20, height: 20, borderRadius: '50%', border: 1, borderColor: 'divider', flexShrink: 0 }} />}
+                  </Stack>
+                )
+              })}
+            </Box>
+            {downloadProgress.metadata?.profileName && (
+              <Typography variant="body2" color="text.secondary">配置文件：{downloadProgress.metadata.profileName}</Typography>
+            )}
+            {downloadSucceeded && <Alert severity="success">
+              配置文件已写入 eUICC，可返回列表管理。
+              {downloadIccid && <Typography variant="body2" sx={{ mt: 0.5, overflowWrap: 'anywhere' }}>ICCID：{downloadIccid}</Typography>}
+            </Alert>}
+            {downloadErrorText && <Alert severity="error">{downloadErrorText}</Alert>}
+            <Button variant="text" size="small" sx={{ alignSelf: 'flex-start' }} aria-expanded={showRawOutput}
+              aria-controls="lpac-raw-output" onClick={() => setShowRawOutput((current) => !current)}>
+              {showRawOutput ? '隐藏原始输出' : '显示原始输出'}
+            </Button>
+            {showRawOutput && <Box
+              id="lpac-raw-output"
               component="pre"
               ref={outputRef}
               sx={{
@@ -469,7 +581,7 @@ export default function EuiccManagementPage() {
               }}
             >
               {downloadOutput || (downloadRunning ? '等待 LPAC 输出…' : '')}
-            </Box>
+            </Box>}
           </Stack>
         </DialogContent>
         <DialogActions>

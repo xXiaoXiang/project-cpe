@@ -270,6 +270,10 @@ async fn main() -> Result<()> {
         .route("/api/euicc", get(get_euicc_info).options(options_handler))
         .route("/api/euicc/profile/enable", post(enable_euicc_profile).options(options_handler))
         .route("/api/euicc/profile/delete", post(delete_euicc_profile).options(options_handler))
+        .route("/api/euicc/profile/nickname", post(nickname_euicc_profile).options(options_handler))
+        .route("/api/euicc/notifications", get(list_euicc_notifications).options(options_handler))
+        .route("/api/euicc/notifications/process", post(process_euicc_notifications).options(options_handler))
+        .route("/api/euicc/notifications/remove", post(remove_euicc_notifications).options(options_handler))
         .route("/api/euicc/refresh-sim", post(refresh_euicc_sim).options(options_handler))
         .route("/api/euicc/profile/download", post(download_euicc_profile).options(options_handler))
         // ========== 网络接口 ==========

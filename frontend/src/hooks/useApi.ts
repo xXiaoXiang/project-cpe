@@ -8,7 +8,9 @@
  * 
  * Copyright (c) 2025 by 1orz, All Rights Reserved. 
  */
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { useSingleFlight } from './useSingleFlight'
+import { useAdaptivePolling } from './useAdaptivePolling'
 
 interface UseApiOptions {
   autoFetch?: boolean
@@ -30,32 +32,24 @@ export function useApi<T>(
   const [data, setData] = useState<T | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<Error | null>(null)
+  const run = useSingleFlight()
+  const fetcherRef = useRef(fetcher)
+  useEffect(() => { fetcherRef.current = fetcher }, [fetcher])
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(() => run('data', async () => {
     setLoading(true)
     setError(null)
     try {
-      const result = await fetcher()
+      const result = await fetcherRef.current()
       setData(result)
     } catch (err) {
       setError(err instanceof Error ? err : new Error(String(err)))
     } finally {
       setLoading(false)
     }
-  }, [fetcher])
+  }), [run])
 
-  useEffect(() => {
-    if (autoFetch) {
-      void refresh()
-    }
-  }, [autoFetch, refresh])
-
-  useEffect(() => {
-    if (refreshInterval && refreshInterval > 0) {
-      const interval = setInterval(refresh, refreshInterval)
-      return () => clearInterval(interval)
-    }
-  }, [refreshInterval, refresh])
+  useAdaptivePolling({ refreshInterval: refreshInterval ?? 0, onTick: refresh, immediate: autoFetch })
 
   return { data, loading, error, refresh }
 }
