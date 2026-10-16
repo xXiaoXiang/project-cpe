@@ -51,7 +51,8 @@ where
             || message.contains("ModemReadDeferred:")
             || ((message.contains("UnknownMethod") || message.contains("UnknownInterface"))
                 && ["org.ofono.NetworkRegistration", "org.ofono.NetworkMonitor", "org.ofono.SimManager",
-                    "org.ofono.MessageManager", "org.ofono.ConnectionManager", "org.ofono.RadioSettings"]
+                    "org.ofono.MessageManager", "org.ofono.ConnectionManager", "org.ofono.RadioSettings",
+                    "org.ofono.IpMultimediaSystem"]
                     .iter().any(|interface| message.contains(interface)));
         Self {
             status: if deferred { "deferred" } else { "error" }.to_string(),
@@ -1265,5 +1266,35 @@ pub struct OtaApplyRequest {
     /// 是否立即重启
     #[serde(default)]
     pub restart_now: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApiResponse;
+
+    #[test]
+    fn missing_ims_interface_is_deferred() {
+        for error in ["UnknownMethod", "UnknownInterface"] {
+            let response = ApiResponse::<()>::error(format!(
+                "Failed to get IMS status: org.freedesktop.DBus.Error.{error}: \
+                 Method GetProperties on interface org.ofono.IpMultimediaSystem doesn't exist"
+            ));
+            assert_eq!(response.status, "deferred");
+            assert_eq!(response.retry_after_ms, Some(5000));
+            assert!(response.data.is_none());
+        }
+    }
+
+    #[test]
+    fn genuine_ims_and_unrelated_interface_errors_remain_errors() {
+        for message in [
+            "Failed to get IMS status: org.freedesktop.DBus.Error.AccessDenied: org.ofono.IpMultimediaSystem",
+            "org.freedesktop.DBus.Error.UnknownMethod: org.example.OtherInterface",
+        ] {
+            let response = ApiResponse::<()>::error(message);
+            assert_eq!(response.status, "error");
+            assert_eq!(response.retry_after_ms, None);
+        }
+    }
 }
 

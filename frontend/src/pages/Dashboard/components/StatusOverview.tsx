@@ -8,7 +8,7 @@
  *
  * Copyright (c) 2025 by 1orz, All Rights Reserved.
  */
-import { Box, Chip, Typography, Paper, useTheme, type Theme } from '@mui/material'
+import { Box, Chip, Tooltip, Typography, Paper, useTheme, type Theme } from '@mui/material'
 import { alpha } from '@/utils/theme'
 import {
   SignalCellularAlt,
@@ -18,7 +18,7 @@ import {
   FlightTakeoff,
   TravelExplore,
 } from '@mui/icons-material'
-import { formatCarrierName, getCarrierColor, getCarrierLogo } from '@/utils/carriers'
+import { formatCarrierName, getCarrierColor, getCarrierInfo, getCarrierLogo } from '@/utils/carriers'
 import { getSignalColor } from '../utils'
 import type { DeviceInfo, NetworkInfo, CellsResponse, AirplaneModeResponse, ImsStatusResponse, RoamingResponse } from '@/api/types'
 
@@ -29,6 +29,7 @@ interface StatusOverviewProps {
   airplaneMode: AirplaneModeResponse | null
   imsStatus: ImsStatusResponse | null
   roaming?: RoamingResponse | null
+  waitingMessage?: string | null
 }
 
 export function StatusOverview({
@@ -38,15 +39,17 @@ export function StatusOverview({
   airplaneMode,
   imsStatus,
   roaming,
+  waitingMessage,
 }: StatusOverviewProps) {
   const theme = useTheme<Theme>()
   const mode = airplaneMode ?? deviceInfo
   const radioOnline = mode?.powered === true && mode.online === true
   const flightMode = airplaneMode?.enabled === true && airplaneMode.powered
   const registered = radioOnline && ['registered', 'roaming'].includes(networkInfo?.registration_status ?? '')
+  const searching = radioOnline && ['searching', 'initializing'].includes(networkInfo?.registration_status ?? '')
 
   const networkTech = (() => {
-    if (!registered) return 'N/A'
+    if (!radioOnline) return 'N/A'
     if (networkInfo?.technology && networkInfo.technology !== 'unknown') return networkInfo.technology.toUpperCase()
     if (cellsInfo?.serving_cell?.tech) {
       return cellsInfo.serving_cell.tech.toUpperCase()
@@ -75,6 +78,7 @@ export function StatusOverview({
   const carrierLabel = registered && networkInfo ? formatCarrierName(networkInfo.mcc, networkInfo.mnc)
     : !mode ? '载入中' : flightMode ? '射频已关闭' : !radioOnline ? '无网络连接' : registrationLabel
   const carrierLogo = registered && networkInfo ? getCarrierLogo(networkInfo.mcc, networkInfo.mnc) : null
+  const carrierLogoBadge = registered && networkInfo ? getCarrierInfo(networkInfo.mcc, networkInfo.mnc)?.logoBadge : undefined
 
   return (
     <Paper
@@ -98,8 +102,24 @@ export function StatusOverview({
       <Box display="flex" flexWrap="wrap" alignItems="center" gap={2}>
         <Box display="flex" alignItems="center" gap={1.5}>
           {carrierLogo ? (
-            <Box component="img" src={carrierLogo} alt={carrierLabel} sx={{ height: 32, width: 'auto', objectFit: 'contain' }} />
-          ) : (
+            <Box sx={{ position: 'relative', display: 'inline-flex', pr: carrierLogoBadge ? 1 : 0 }}>
+              <Box component="img" src={carrierLogo} alt={carrierLabel} title={carrierLabel} sx={{ height: 32, width: 'auto', maxWidth: 160, objectFit: 'contain' }} />
+              {carrierLogoBadge && (
+                <Box
+                  component="span"
+                  aria-hidden="true"
+                  sx={{
+                    position: 'absolute', right: 0, bottom: -2,
+                    px: 0.4, borderRadius: 0.5, bgcolor: 'background.paper', color: 'text.primary',
+                    fontSize: 10, fontWeight: 800, lineHeight: 1.4,
+                    border: '1px solid', borderColor: 'divider',
+                  }}
+                >
+                  {carrierLogoBadge}
+                </Box>
+              )}
+            </Box>
+          ) : !searching && (
             <Chip
               label={carrierLabel}
               color={registered && networkInfo ? getCarrierColor(networkInfo.mcc, networkInfo.mnc) : 'default'}
@@ -114,15 +134,50 @@ export function StatusOverview({
           </Box>
         </Box>
 
-        {registered && networkTech !== 'N/A' && <Chip
-          icon={<WifiTethering />}
-          label={networkTech}
-          color={networkTech === '5G' || networkTech === 'NR' ? 'success' : networkTech === 'N/A' ? 'default' : 'primary'}
-          size="small"
-          sx={{ fontWeight: 'bold' }}
-        />}
+        {(searching || networkTech !== 'N/A') && (
+          <Tooltip title={searching ? registrationLabel : waitingMessage ?? ''}>
+            <Box
+              data-network-technology
+              data-searching={searching}
+              aria-label={searching ? `${networkTech === 'N/A' ? '-' : networkTech}，${registrationLabel}` : undefined}
+              sx={{ position: 'relative', display: 'inline-flex', p: '3px', borderRadius: 999 }}
+            >
+              <Chip
+                icon={<WifiTethering />}
+                label={networkTech === 'N/A' ? '-' : networkTech}
+                color={networkTech === '5G' || networkTech === 'NR' ? 'success' : 'primary'}
+                size="small"
+                sx={{ fontWeight: 'bold' }}
+              />
+              {searching && (
+                <Box
+                  component="svg"
+                  aria-hidden="true"
+                  sx={{
+                    position: 'absolute', inset: 0, width: '100%', height: '100%',
+                    pointerEvents: 'none', fill: 'none', color: 'primary.main',
+                    '& rect': {
+                      width: 'calc(100% - 2px)', height: 'calc(100% - 2px)',
+                      stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round',
+                      strokeDasharray: '28 72',
+                      animation: 'network-search-border 1.8s linear infinite',
+                    },
+                    '@keyframes network-search-border': {
+                      from: { strokeDashoffset: 0 }, to: { strokeDashoffset: -100 },
+                    },
+                    '@media (prefers-reduced-motion: reduce)': {
+                      '& rect': { animation: 'none' },
+                    },
+                  }}
+                >
+                  <rect x="1" y="1" rx="14" pathLength="100" />
+                </Box>
+              )}
+            </Box>
+          </Tooltip>
+        )}
 
-        {radioOnline && <Chip icon={<Router />} label={registrationLabel} color={registrationColor} variant="outlined" size="small" />}
+        {radioOnline && !searching && <Chip icon={<Router />} label={registrationLabel} color={registrationColor} variant="outlined" size="small" />}
 
         {registered && roaming?.is_roaming && (
           <Chip

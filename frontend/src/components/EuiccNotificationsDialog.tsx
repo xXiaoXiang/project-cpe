@@ -10,7 +10,7 @@ import { useSingleFlight } from '../hooks/useSingleFlight'
 
 const safeToRemove = (notification: EuiccNotification) =>
   ['enable', 'disable'].includes(notification.profileManagementOperation)
-const operationLabels: Record<string, string> = { enable: '（启用）', disable: '（停用）', delete: '（删除）' }
+const operationLabels: Record<string, string> = { enable: '（启用）', disable: '（停用）', delete: '（删除）', install: '（安装）' }
 
 export default function EuiccNotificationsDialog({ onClose }: { onClose: () => void }) {
   const [notifications, setNotifications] = useState<EuiccNotification[]>([])

@@ -8,7 +8,7 @@
  *
  * Copyright (c) 2025 by 1orz, All Rights Reserved.
  */
-import { Alert, Box, LinearProgress } from '@mui/material'
+import { Box, LinearProgress } from '@mui/material'
 import Grid from '@mui/material/Grid'
 import { useRefreshInterval } from '@/contexts/RefreshContext'
 import ErrorSnackbar from '@/components/ErrorSnackbar'
@@ -32,7 +32,6 @@ export default function Dashboard() {
   return (
     <Box>
       <ErrorSnackbar error={error} onClose={() => setError(null)} />
-      {waitingMessage && !data.airplaneMode?.enabled && <Alert severity="info" sx={{ mb: 2 }}>{waitingMessage}</Alert>}
 
       {initialLoading && (
         <Box sx={{ mb: 2 }}>
@@ -48,6 +47,7 @@ export default function Dashboard() {
         airplaneMode={data.airplaneMode}
         imsStatus={data.imsStatus}
         roaming={data.roaming}
+        waitingMessage={waitingMessage}
       />
 
       {/* 主体内容区，PC 端采用多列布局 */}

@@ -11,7 +11,7 @@
     "lint:fix": "eslint . --fix",
     "preview": "vite preview",
     "type-check": "tsc -b --noEmit",
-    "test": "node --test tests/requests.test.ts tests/euicc.test.ts",
+    "test": "node --test tests/requests.test.ts tests/euicc.test.ts tests/carriers.test.ts",
     "test:pages": "node --test tests/pages.test.ts"
   },
   "dependencies": {

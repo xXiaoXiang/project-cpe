@@ -151,7 +151,7 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
       fetchInto('cells', '小区信息', () => api.getCellsInfo(), setCellsInfo, () => setCellsInfo(null)),
       fetchInto('qos', 'QoS 信息', () => api.getQosInfo(), setQosInfo, () => setQosInfo(null)),
       pendingControlRef.current ? Promise.resolve() : fetchInto('airplane', '飞行模式状态', () => api.getAirplaneMode(), applyControl(setAirplaneMode)),
-      fetchInto('ims', 'IMS 状态', () => api.getImsStatus(), setImsStatus),
+      fetchInto('ims', 'IMS 状态', () => api.getImsStatus(), setImsStatus, () => setImsStatus(null)),
       pendingControlRef.current ? Promise.resolve() : fetchInto('roaming', '漫游状态', () => api.getRoamingStatus(), applyControl(setRoaming)),
     ])
   }, [fetchInto, updateSpeedHistory])

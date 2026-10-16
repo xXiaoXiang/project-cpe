@@ -194,7 +194,7 @@ pub async fn get_euicc_info(State(_conn): State<Arc<Connection>>) -> Response {
 
 /// POST /api/euicc/profile/enable - 启用 Profile，确认切换成功后返回最新 Profile 列表
 pub async fn enable_euicc_profile(
-    State(_conn): State<Arc<Connection>>,
+    State(conn): State<Arc<Connection>>,
     Json(request): Json<EuiccProfileRequest>,
 ) -> Response {
     if let Err(error) = validate_euicc_identifier(&request.iccid) {
@@ -209,7 +209,7 @@ pub async fn enable_euicc_profile(
         request.iccid.clone(),
         "1".to_string(),
     ];
-    let result: Result<Vec<EuiccProfile>, String> = crate::serial::with_euicc_serial(async {
+    let result: Result<(Vec<EuiccProfile>, Option<String>), String> = crate::serial::with_euicc_serial(async {
         run_lpac_json(&args).await?;
 
         let list_args = vec!["profile".to_string(), "list".to_string()];
@@ -225,7 +225,14 @@ pub async fn enable_euicc_profile(
                                 && profile.profile_state.eq_ignore_ascii_case("enabled")
                         }) =>
                     {
-                        return Ok(profiles);
+                        // Keep the eUICC change serialized through selection recovery.
+                        // A failed recovery must not hide an already successful switch.
+                        let selection_warning = crate::dbus::register_operator_auto(&conn)
+                            .await.err().map(|error| error.to_string());
+                        if let Some(warning) = &selection_warning {
+                            tracing::warn!("Profile enabled but automatic selection was not confirmed: {}", warning);
+                        }
+                        return Ok((profiles, selection_warning));
                     }
                     Ok(_) => last_error = "Profile list does not show the target as enabled".to_string(),
                     Err(error) => last_error = format!("Invalid lpac profile list: {error}"),
@@ -238,11 +245,12 @@ pub async fn enable_euicc_profile(
     .await;
 
     match result {
-        Ok(profiles) => (
+        Ok((profiles, selection_warning)) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
                 "Profile enabled",
-                json!({ "iccid": request.iccid, "profiles": profiles }),
+                json!({ "iccid": request.iccid, "profiles": profiles,
+                    "network_selection_warning": selection_warning }),
             )),
         )
             .into_response(),
@@ -2799,7 +2807,7 @@ pub async fn register_operator_auto_handler(
     match crate::dbus::register_operator_auto(&conn).await {
         Ok(_) => (
             StatusCode::OK,
-            Json(ApiResponse::success_with_message("Automatic registration initiated", json!({}))),
+            Json(ApiResponse::success_with_message("Automatic operator selection confirmed; registration may still be in progress", json!({}))),
         ),
         Err(e) => (
             StatusCode::OK,

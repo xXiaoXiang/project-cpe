@@ -288,7 +288,7 @@ export default function NetworkPage() {
     try {
       const response = await api.registerOperatorAuto()
       if (response.status === 'ok') {
-        setSuccess('已启动自动注册...')
+        setSuccess('已确认自动选网，正在等待网络注册...')
         setTimeout(loadData, 3000)
       } else {
         setError(response.message || '自动注册失败')

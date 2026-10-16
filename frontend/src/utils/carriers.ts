@@ -19,6 +19,9 @@ export interface CarrierInfo {
   status: string
   technology?: string
   notes?: string
+  logo?: string
+  logoBadge?: string
+  color?: 'default' | 'primary' | 'secondary' | 'error' | 'info' | 'success' | 'warning'
 }
 
 export const CHINA_CARRIERS: CarrierInfo[] = [
@@ -132,19 +135,37 @@ export const CHINA_CARRIERS: CarrierInfo[] = [
   },
 ]
 
-const carrierMap = new Map<string, CarrierInfo>()
-CHINA_CARRIERS.forEach((carrier) => {
-  carrierMap.set(carrier.mccMnc, carrier)
-})
+// MCC 454: several PLMNs can belong to the same Hong Kong operator.
+const HONG_KONG_OPERATOR_GROUPS = [
+  { mncs: ['00', '02', '10', '18'], operatorCn: 'CSL', operatorEn: 'CSL Mobile Limited', brand: '1010 / csl. / SUN Mobile', logo: '/provider/csl.svg', color: 'warning' },
+  { mncs: ['03', '04', '14'], operatorCn: '3HK', operatorEn: 'Hutchison Telecom', brand: '3HK', logo: '/provider/three_hk.svg', color: 'error' },
+  { mncs: ['07'], operatorCn: '中国联通香港', operatorEn: 'China Unicom (Hong Kong)', brand: '中国联通香港', logo: '/provider/china-unicom.svg', logoBadge: 'HK', color: 'error' },
+  { mncs: ['12', '13'], operatorCn: '中国移动香港', operatorEn: 'China Mobile Hong Kong', brand: 'CMHK', logo: '/provider/china-mobile.svg', logoBadge: 'HK', color: 'success' },
+  { mncs: ['16', '19', '29'], operatorCn: 'HKT', operatorEn: 'Hong Kong Telecommunications', brand: 'HKT', logo: '/provider/hkt.svg', color: 'primary' },
+  { mncs: ['15'], operatorCn: 'SmarTone', operatorEn: 'SmarTone', brand: '数码通', logo: '/provider/smartone.svg', color: 'error' },
+  { mncs: ['31'], operatorCn: '中国电信香港', operatorEn: 'China Telecom (Hong Kong)', brand: '中国电信香港', logo: '/provider/china-telecom.svg', logoBadge: 'HK', color: 'primary' },
+] satisfies (Pick<CarrierInfo, 'operatorCn' | 'operatorEn' | 'brand' | 'logo' | 'logoBadge' | 'color'> & { mncs: string[] })[]
+
+export const HONG_KONG_CARRIERS: CarrierInfo[] = HONG_KONG_OPERATOR_GROUPS.flatMap(({ mncs, ...operator }) =>
+  mncs.map((mnc) => ({ ...operator, mcc: '454', mnc, mccMnc: `454${mnc}`, status: '运营中' }))
+)
+
+const carrierMap = new Map<string, CarrierInfo>(
+  [...CHINA_CARRIERS, ...HONG_KONG_CARRIERS].map((carrier) => [carrier.mccMnc, carrier])
+)
+
+function normalizePlmn(mcc: string | number | undefined, mnc: string | number | undefined) {
+  if (mcc === undefined || mnc === undefined) return null
+  const mccValue = String(mcc).trim()
+  const mncValue = String(mnc).trim()
+  if (!mccValue || !mncValue) return null
+  // Keep three-digit MNCs distinct from two-digit MNCs (003 is not 03).
+  return { mcc: mccValue.padStart(3, '0'), mnc: mncValue.padStart(2, '0') }
+}
 
 export function getCarrierInfo(mcc: string | number | undefined, mnc: string | number | undefined): CarrierInfo | null {
-  if (!mcc || !mnc) return null
-
-  const mccStr = String(mcc).padStart(3, '0')
-  const mncStr = String(mnc).padStart(2, '0')
-  const mccMnc = `${mccStr}${mncStr}`
-
-  return carrierMap.get(mccMnc) || null
+  const plmn = normalizePlmn(mcc, mnc)
+  return plmn ? carrierMap.get(`${plmn.mcc}${plmn.mnc}`) ?? null : null
 }
 
 export function formatCarrierName(
@@ -155,7 +176,7 @@ export function formatCarrierName(
   const carrier = getCarrierInfo(mcc, mnc)
 
   if (!carrier) {
-    if (mcc && mnc) {
+    if (normalizePlmn(mcc, mnc)) {
       return `${mcc}-${mnc}`
     }
     return '未知'
@@ -172,10 +193,12 @@ export function getCarrierColor(
   mcc: string | number | undefined,
   mnc: string | number | undefined
 ): 'default' | 'primary' | 'secondary' | 'error' | 'info' | 'success' | 'warning' {
-  if (!mcc || !mnc) return 'default'
+  const carrier = getCarrierInfo(mcc, mnc)
+  if (carrier?.color) return carrier.color
+  const plmn = normalizePlmn(mcc, mnc)
+  if (!plmn) return 'default'
 
-  const mccStr = String(mcc)
-  const mncStr = String(mnc).padStart(2, '0')
+  const { mcc: mccStr, mnc: mncStr } = plmn
 
   if (mccStr === '460') {
     switch (mncStr) {
@@ -201,10 +224,12 @@ export function getCarrierColor(
 }
 
 export function getCarrierLogo(mcc: string | number | undefined, mnc: string | number | undefined): string | null {
-  if (!mcc || !mnc) return null
+  const carrier = getCarrierInfo(mcc, mnc)
+  if (carrier?.logo) return carrier.logo
+  const plmn = normalizePlmn(mcc, mnc)
+  if (!plmn) return null
 
-  const mccStr = String(mcc)
-  const mncStr = String(mnc).padStart(2, '0')
+  const { mcc: mccStr, mnc: mncStr } = plmn
 
   if (mccStr === '460') {
     switch (mncStr) {

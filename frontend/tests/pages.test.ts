@@ -10,7 +10,7 @@ import process from 'node:process'
 import { setTimeout as delay } from 'node:timers/promises'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import type { EuiccNotification, LpacEvent } from '../src/api/types.ts'
+import type { EuiccNotification, EuiccProfile, LpacEvent } from '../src/api/types.ts'
 
 // Run after building. Uses a local mock API and Chromium's DevTools protocol;
 // no device, browser automation package, or real mutation API is involved.
@@ -50,6 +50,8 @@ const fixtures: Record<string, unknown> = {
       serviceProviderName: 'BetterRoaming', profileName: 'BetterRoaming', iconType: null, icon: null, profileClass: 'operational' },
     { iccid: '8985203130001133747', isdpAid: 'active', profileState: 'enabled', profileNickname: null,
       serviceProviderName: '3', profileName: '3', iconType: null, icon: null, profileClass: 'operational' },
+    { iccid: '8965012605253617847', isdpAid: 'trip', profileState: 'disabled', profileNickname: '旅行卡',
+      serviceProviderName: 'Trip', profileName: 'Singtel', iconType: null, icon: null, profileClass: 'provisioning' },
   ] },
 }
 
@@ -64,9 +66,11 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
   let aborted = 0
   let downloadResponse: ServerResponse | undefined
   let qosError = ''
+  let selectionWarning: string | null = null
   const controlWrites: { path: string; payload: Record<string, boolean>; response: ServerResponse }[] = []
   let notifications: EuiccNotification[] = [
     { seqNumber: 29, iccid: '8965012512294623745', profileManagementOperation: 'future-operation' },
+    { seqNumber: 30, iccid: '8965012512294623745', profileManagementOperation: 'install' },
     { seqNumber: 27, iccid: '8985203130001133747', profileManagementOperation: 'enable' },
     { seqNumber: 28, iccid: '8965012512294623745', profileManagementOperation: 'delete' },
     { seqNumber: 26, iccid: '8965012512294623745', profileManagementOperation: 'disable' },
@@ -119,6 +123,11 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
             jsonReply(res, { removed: removed.map((item) => item.seqNumber), failed: [], skipped: payload.all ? notifications.length : 0 })
           } else if (endpoint === '/euicc/profile/nickname') {
             jsonReply(res, { iccid: payload.iccid, nickname: payload.nickname })
+          } else if (endpoint === '/euicc/profile/enable') {
+            const info = fixtures['/euicc'] as { profiles: EuiccProfile[] }
+            info.profiles = info.profiles.map((profile) => ({ ...profile,
+              profileState: profile.iccid === payload.iccid ? 'enabled' : 'disabled' }))
+            jsonReply(res, { iccid: payload.iccid, profiles: info.profiles, network_selection_warning: selectionWarning })
           } else jsonReply(res, {})
         })().catch(() => { res.writeHead(500); res.end() })
         return
@@ -257,6 +266,27 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
     })
   }
 
+  await t.test('carrier logos and HK badges follow the current registered PLMN', async () => {
+    const originalNetwork = fixtures['/network']
+    slowPath = ''
+    await call('Page.navigate', { url: `${origin}/` })
+    const overview = 'document.querySelector("[data-network-overview]")'
+    const logo = `${overview}?.querySelector('img')`
+    for (const [mcc, mnc, name, file, badge] of [
+      ['454', '03', '3HK', 'three_hk.svg', false],
+      ['454', '12', '中国移动香港', 'china-mobile.svg', true],
+      ['460', '00', '中国移动', 'china-mobile.svg', false],
+      ['454', '16', 'HKT', 'hkt.svg', false],
+    ] as const) {
+      fixtures['/network'] = { ...(originalNetwork as object), mcc, mnc }
+      await waitFor(`${logo}?.alt === ${JSON.stringify(name)}`)
+      assert.equal(await evaluate(`${logo}.getAttribute('src')`), `/provider/${file}`)
+      await waitFor(`${logo}.complete && ${logo}.naturalWidth > 0`)
+      assert.equal(await evaluate(`${overview}.innerText.includes('HK')`), badge)
+    }
+    fixtures['/network'] = originalNetwork
+  })
+
   await t.test('modem startup, busy recovery, airplane display and actual technology', async () => {
     slowPath = '/cells'
     counts = new Map()
@@ -290,13 +320,27 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
       assert.equal(await evaluate(`${overview}.innerText.includes(${JSON.stringify(stale)})`), false)
     }
     assert.equal(await evaluate(`${overview}.querySelector('img') !== null`), false)
+    assert.equal(await evaluate(`${overview}.querySelector('[data-searching="true"]') !== null`), false)
 
     fixtures['/airplane-mode'] = { enabled: false, powered: true, online: true }
     const originalNetwork = fixtures['/network']
     fixtures['/network'] = { ...(originalNetwork as object), registration_status: 'searching' }
     counts = new Map()
     await call('Page.navigate', { url: `${origin}/` })
-    await waitFor(`${overview}?.innerText.includes('正在搜网')`)
+    const technology = `${overview}?.querySelector('[data-network-technology]')`
+    await waitFor(`${technology}?.dataset.searching === 'true'`)
+    assert.equal(await evaluate(`${technology}.innerText`), '-')
+    assert.equal(await evaluate(`${overview}.innerText.includes('正在搜网')`), false)
+    assert.equal(await evaluate('document.querySelector(".MuiAlert-standardInfo") !== null'), false)
+    const border = `${technology}.querySelector('rect')`
+    assert.equal(await evaluate(`getComputedStyle(${border}).animationDuration`), '1.8s')
+    assert.equal(await evaluate(`getComputedStyle(${border}).animationIterationCount`), 'infinite')
+    await call('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] })
+    assert.equal(await evaluate(`getComputedStyle(${border}).animationName`), 'none')
+    await call('Emulation.setEmulatedMedia', { features: [] })
+    fixtures['/network'] = { ...(originalNetwork as object), registration_status: 'searching', technology: 'lte' }
+    await waitFor(`${technology}?.innerText === 'LTE'`)
+    assert.equal(await evaluate(`${technology}.dataset.searching`), 'true', 'Known technology remains visible while searching')
     await delay(2200)
     assert.equal(counts.get('/cells') ?? 0, 0)
     assert.equal(counts.get('/qos') ?? 0, 0)
@@ -307,6 +351,8 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
 
     fixtures['/network'] = originalNetwork
     qosError = 'Failed to get QoS info: org.ofono.Error.InProgress: Operation already in progress'
+    await waitFor(`${technology}?.dataset.searching === 'false'`)
+    assert.equal(await evaluate(`${technology}.querySelector('svg rect') !== null`), false, 'Stop the border animation once registered')
     const attemptedBy = Date.now() + 10_000
     while (!counts.get('/qos') && Date.now() < attemptedBy) await delay(100)
     assert.equal(counts.get('/qos'), 1)
@@ -402,6 +448,7 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
 
   await t.test('eUICC nickname, notification safety and live download progress', async () => {
     slowPath = ''
+    await call('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false })
     await call('Page.navigate', { url: `${origin}/euicc` })
     await waitFor(textHas('BetterRoaming'))
     const click = (label: string) => evaluate(`Array.from(document.querySelectorAll('button')).find(x => x.getAttribute('aria-label') === ${JSON.stringify(label)} || x.innerText.trim() === ${JSON.stringify(label)})?.click()`)
@@ -414,6 +461,19 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
 
     assert.equal(await evaluate('document.querySelector(\'a[href="https://github.com/xXiaoXiang/project-cpe"]\') !== null'), true)
     assert.equal(await evaluate('document.querySelector(\'button[aria-label="删除 BetterRoaming"]\').innerText'), '删除')
+    const tripCard = `document.querySelector('[data-profile="8965012605253617847"]')`
+    const tripHeading = `${tripCard}.querySelector('[data-profile-heading]')`
+    assert.deepEqual(await evaluate(`Array.from(${tripHeading}.querySelectorAll('.MuiTypography-root')).map(x => x.innerText)`), ['Singtel', 'Trip', '旅行卡'])
+    assert.equal(await evaluate(`getComputedStyle(${tripHeading}.querySelector('h2')).fontWeight`), '700')
+    assert.equal(await evaluate(`getComputedStyle(${tripHeading}.querySelector('[title="Trip"]')).fontWeight`), '400')
+    assert.equal(await evaluate(`Array.from(document.querySelectorAll('[data-profile-heading]')).find(x => x.innerText.includes('BetterRoaming')).querySelectorAll('[title="BetterRoaming"]').length`), 1, 'Do not duplicate matching provider and profile names')
+    assert.equal(await evaluate(`${tripCard}.innerText.includes('引导配置（provisioning）')`), true)
+    assert.equal(await evaluate(`document.querySelector('[data-profile="8985203130001133747"]').innerText.includes('业务配置（operational）')`), true)
+    assert.equal(await evaluate(`(() => {
+      const cards = Array.from(document.querySelectorAll('[data-profile]'));
+      const bounds = cards.map(x => x.getBoundingClientRect());
+      return bounds.every(x => bounds.filter(y => Math.abs(x.top - y.top) < 1).every(y => Math.abs(x.height - y.height) < 1));
+    })()`), true, 'Profile cards on the same row have equal heights')
     await click('启用 BetterRoaming')
     await waitFor(textHas('启用BetterRoaming会关闭3，确认是否继续？'))
     assert.equal(actions.filter((item) => item.path.endsWith('/enable')).length, 0)
@@ -428,16 +488,41 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
     await waitFor(textHas('测试eSIM😀'))
     assert.equal(actions.at(-1)?.body.nickname, '测试eSIM😀')
     assert.equal(await evaluate('document.querySelector("h2").innerText'), 'BetterRoaming')
+    await call('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: false })
+    await waitFor(`Array.from(document.querySelectorAll('[data-profile]')).every(x => x.scrollWidth <= x.clientWidth)`)
+    assert.equal(await evaluate(`(() => {
+      const centers = Array.from(${tripHeading}.querySelectorAll('.MuiTypography-root')).map(x => {
+        const rect = x.getBoundingClientRect();
+        return rect.top + rect.height / 2;
+      });
+      return Math.max(...centers) - Math.min(...centers) < 1;
+    })()`), true, 'Keep profile, provider and nickname on one line on narrow screens')
+    await call('Emulation.clearDeviceMetricsOverride')
+
+    selectionWarning = 'TEST: Modem selection mode is still manual'
+    await click('启用 BetterRoaming')
+    await waitFor(textHas('启用BetterRoaming会关闭3，确认是否继续？'))
+    await evaluate(`document.querySelector('[role="dialog"] .MuiDialogActions-root button:last-child').click()`)
+    await waitFor(textHas('Profile 已切换，但自动选网尚未确认'))
+    assert.equal(await evaluate('document.querySelector(\'button[aria-label="启用 BetterRoaming"]\').disabled'), true, 'Keep the confirmed new profile enabled even if selection recovery fails')
+    assert.equal(await evaluate(textHas('Profile 切换失败')), false)
+    selectionWarning = null
+    await click('启用 Singtel')
+    await waitFor(textHas('启用Singtel会关闭BetterRoaming，确认是否继续？'))
+    await evaluate(`document.querySelector('[role="dialog"] .MuiDialogActions-root button:last-child').click()`)
+    await waitFor(textHas('Profile 已切换，已恢复自动选网'))
+    assert.equal(await evaluate('document.querySelector(\'button[aria-label="启用 Singtel"]\').disabled'), true)
 
     await click('通知管理')
     await waitFor(textHas('通知 #28'))
+    assert.equal(await evaluate(`document.querySelector('[data-notification="30"]').innerText.includes('install（安装）')`), true)
     assert.equal(await evaluate('document.querySelectorAll("[data-notification-group]").length'), 2)
-    assert.deepEqual(await evaluate(`Array.from(document.querySelector('[data-notification-group="8965012512294623745"]').querySelectorAll('[data-notification]')).map(x => x.getAttribute('data-notification'))`), ['26', '28', '29'])
+    assert.deepEqual(await evaluate(`Array.from(document.querySelector('[data-notification-group="8965012512294623745"]').querySelectorAll('[data-notification]')).map(x => x.getAttribute('data-notification'))`), ['26', '28', '29', '30'])
     await click('折叠 ICCID 8965012512294623745 的通知')
     await waitFor(`document.querySelector('[data-notification-group="8965012512294623745"]').querySelectorAll('[data-notification]').length === 0`)
     assert.equal(await evaluate('document.querySelectorAll("[data-notification]").length'), 1)
     await click('展开 ICCID 8965012512294623745 的通知')
-    await waitFor('document.querySelectorAll("[data-notification]").length === 4')
+    await waitFor('document.querySelectorAll("[data-notification]").length === 5')
     await waitFor(`getComputedStyle(document.querySelector('[data-notification]').parentElement).gridTemplateColumns.split(' ').length === 2`)
     await call('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: false })
     await waitFor(`getComputedStyle(document.querySelector('[data-notification]').parentElement).gridTemplateColumns.split(' ').length === 1`)
@@ -452,7 +537,7 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
     await call('Emulation.clearDeviceMetricsOverride')
     await click('发送通知 28')
     await waitFor(textHas('通知已发送，记录保留供自行管理。'))
-    assert.equal(await evaluate('document.querySelectorAll("[data-notification]").length'), 4)
+    assert.equal(await evaluate('document.querySelectorAll("[data-notification]").length'), 5)
     assert.equal(actions.at(-1)?.body.seq_number, 28)
     await click('删除通知 28')
     await waitFor(textHas('确认删除通知 #28'))
@@ -461,20 +546,23 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
     await click('删除通知 29')
     await waitFor(textHas('future-operation 操作'))
     await click('取消')
+    await click('删除通知 30')
+    await waitFor(textHas('install 操作'))
+    await click('取消')
     await evaluate(`document.querySelector('[data-notification-bulk-actions]').scrollIntoView({ block: 'end' })`)
     await click('全部删除')
     await waitFor(textHas('已删除 2 条通知。'))
     assert.equal(actions.at(-1)?.body.all, true)
-    await waitFor('document.querySelectorAll("[data-notification]").length === 2')
+    await waitFor('document.querySelectorAll("[data-notification]").length === 3')
     await click('删除通知 28')
     await waitFor(textHas('确认删除通知 #28'))
     await click('确认删除')
-    await waitFor('document.querySelectorAll("[data-notification]").length === 1')
+    await waitFor('document.querySelectorAll("[data-notification]").length === 2')
     assert.equal(actions.at(-1)?.body.confirm_sensitive, true)
     await click('全部发送')
     await waitFor(textHas('通知已发送，记录保留供自行管理。'))
     assert.equal(actions.at(-1)?.body.all, true)
-    assert.equal(await evaluate('document.querySelectorAll("[data-notification]").length'), 1)
+    assert.equal(await evaluate('document.querySelectorAll("[data-notification]").length'), 2)
     await click('关闭')
 
     const currentDownload = (): ServerResponse | undefined => downloadResponse

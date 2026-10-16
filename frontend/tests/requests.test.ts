@@ -174,3 +174,49 @@ void test('interface recovery is deferred, while genuine modem errors remain vis
   clock += 5000
   await assert.rejects(policy.read('/cells', () => Promise.resolve({ status: 'error', message: 'DBus connection lost' })), /DBus connection lost/)
 })
+
+void test('IMS waits for profile transitions and stable registration, then backs off missing interfaces', async () => {
+  let clock = 1000
+  let registration = 'searching'
+  let imsError = 'Failed to get IMS status: org.freedesktop.DBus.Error.UnknownMethod: Method "GetProperties" with signature "" on interface "org.ofono.IpMultimediaSystem" doesn\'t exist'
+  let imsCalls = 0
+  const policy = createModemReadPolicy(() => clock)
+  const read = (url: string): Promise<ApiResponse<unknown>> => {
+    if (url === '/airplane-mode') return Promise.resolve({ status: 'ok', message: '', data: { powered: true, online: true } })
+    if (url === '/network') return Promise.resolve({ status: 'ok', message: '', data: { registration_status: registration } })
+    if (url === '/ims/status') {
+      imsCalls++
+      return Promise.resolve(imsError ? { status: 'error', message: imsError }
+        : { status: 'ok', message: '', data: { registered: true } })
+    }
+    return Promise.resolve({ status: 'ok', message: '', data: {} })
+  }
+  const query = () => policy.read<ApiResponse<unknown>>('/ims/status', read)
+  policy.beginTransition()
+  assert.equal((await query()).status, 'deferred')
+  policy.endTransition()
+  clock += 3000
+  assert.equal((await query()).status, 'deferred')
+  assert.equal(imsCalls, 0, 'Do not query IMS while searching after a profile switch')
+  registration = 'registered'
+  clock += 5000
+  assert.equal((await query()).status, 'deferred')
+  assert.equal(imsCalls, 0, 'Wait until registration has settled')
+  clock += 3000
+  assert.equal((await query()).status, 'deferred', 'Old backend UnknownMethod responses also defer')
+  assert.equal(imsCalls, 1)
+  for (let tick = 0; tick < 4; tick++) {
+    clock += 1000
+    assert.equal((await query()).status, 'deferred')
+  }
+  assert.equal(imsCalls, 1, 'A one-second refresh must not hammer the missing interface')
+  assert.equal((await policy.read<ApiResponse<unknown>>('/stats', read)).status, 'ok')
+  imsError = ''
+  clock += 1000
+  assert.equal((await query()).status, 'ok', 'Resume IMS automatically once the interface returns')
+  assert.equal(imsCalls, 2)
+  imsError = 'org.freedesktop.DBus.Error.AccessDenied: org.ofono.IpMultimediaSystem'
+  assert.equal((await query()).status, 'error', 'Genuine IMS errors remain visible')
+  imsError = 'org.freedesktop.DBus.Error.UnknownMethod: org.example.OtherInterface'
+  assert.equal((await query()).status, 'error', 'Do not mask unrelated method errors')
+})

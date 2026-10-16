@@ -1467,7 +1467,7 @@ pub async fn get_nitz_time(conn: &Connection) -> zbus::Result<NitzTimeResponse> 
 
 /// 获取 IMS 状态
 pub async fn get_ims_status(conn: &Connection) -> zbus::Result<ImsStatusResponse> {
-    with_serial(async {
+    with_modem_read("ims-status", async {
         let proxy = Proxy::new(conn, "org.ofono", "/ril_0", "org.ofono.IpMultimediaSystem").await?;
         let props: HashMap<String, OwnedValue> = proxy.call("GetProperties", &()).await?;
         
@@ -1659,6 +1659,7 @@ fn parse_operator_info(path: String, props: HashMap<String, OwnedValue>) -> Oper
 
 /// 手动注册到指定运营商
 pub async fn register_operator_manual(conn: &Connection, mccmnc: &str) -> zbus::Result<()> {
+    let _modem_change = crate::serial::modem_change();
     with_serial(async {
         let radio_proxy = RadioSettingsProxy::new(conn).await?;
         let radio_props = radio_proxy.get_properties().await?;
@@ -1715,11 +1716,111 @@ pub async fn register_operator_manual(conn: &Connection, mccmnc: &str) -> zbus::
     }).await
 }
 
-/// 自动注册运营商
+// Verify the Modem rather than trusting ofono's cached NetworkRegistration.Mode.
+fn parse_cops_mode(response: &str) -> Option<u8> {
+    if !response.lines().any(|line| line.trim() == "OK")
+        || response.lines().any(|line| {
+            let line = line.trim();
+            line == "ERROR" || line.starts_with("+CME ERROR:") || line.starts_with("+CMS ERROR:")
+        })
+    {
+        return None;
+    }
+    response.lines().find_map(|line| {
+        line.trim().strip_prefix("+COPS:")?
+            .split(',').next()?.trim().parse::<u8>().ok().filter(|mode| *mode <= 4)
+    })
+}
+
+async fn ensure_automatic_selection<C, Command, P, Pause>(
+    mut command: C,
+    mut pause: P,
+) -> Result<(), String>
+where
+    C: FnMut(&'static str) -> Command,
+    Command: std::future::Future<Output = Result<String, String>>,
+    P: FnMut() -> Pause,
+    Pause: std::future::Future<Output = ()>,
+{
+    let mut last_state = "operator selection mode is unavailable".to_string();
+    let mut mode_known = false;
+    // SIM refresh can briefly remove the AT interface. Retry reads, not writes.
+    for attempt in 0..4 {
+        match command("AT+COPS?").await {
+            Ok(response) => match parse_cops_mode(&response) {
+                Some(0) => return Ok(()),
+                Some(mode) => {
+                    last_state = format!("AT+COPS? reports mode {mode}");
+                    mode_known = true;
+                    break;
+                }
+                None => last_state = format!("Invalid AT+COPS? response: {}", response.trim()),
+            },
+            Err(error) => last_state = error,
+        }
+        if attempt < 3 { pause().await; }
+    }
+    if !mode_known {
+        return Err(format!("Cannot verify automatic operator selection: {last_state}"));
+    }
+
+    // One request only: Failed may still have initiated automatic selection.
+    let selection_error = command("AT+COPS=0").await.err();
+    for _ in 0..6 {
+        pause().await;
+        match command("AT+COPS?").await {
+            Ok(response) => match parse_cops_mode(&response) {
+                Some(0) => return Ok(()),
+                Some(mode) => last_state = format!("AT+COPS? still reports mode {mode}"),
+                None => last_state = format!("Invalid AT+COPS? response: {}", response.trim()),
+            },
+            Err(error) => last_state = error,
+        }
+    }
+    Err(format!("Automatic operator selection was not confirmed: {last_state}{}",
+        selection_error.map(|error| format!("; AT+COPS=0: {error}")).unwrap_or_default()))
+}
+
+/// 恢复自动选网并通过 AT 回读确认，不等待网络注册或数据附着完成。
 pub async fn register_operator_auto(conn: &Connection) -> zbus::Result<()> {
+    let _modem_change = crate::serial::modem_change();
     with_serial(async {
-        let proxy = Proxy::new(conn, "org.ofono", "/ril_0", "org.ofono.NetworkRegistration").await?;
-        proxy.call("Register", &()).await
+        let modem = Proxy::new(conn, "org.ofono", "/ril_0", "org.ofono.Modem").await?;
+        let properties: HashMap<String, OwnedValue> = tokio::time::timeout(
+            Duration::from_secs(10), modem.call("GetProperties", &()),
+        ).await.map_err(|_| zbus::Error::Failure("Reading Modem state timed out".into()))??;
+        let powered = properties.get("Powered").and_then(|value| bool::try_from(value.clone()).ok()).unwrap_or(false);
+        let online = properties.get("Online").and_then(|value| bool::try_from(value.clone()).ok()).unwrap_or(false);
+        if !powered || !online {
+            // Never enable the radio implicitly while the user is in airplane mode.
+            return Err(zbus::Error::Failure("Modem is offline; restore automatic selection after enabling the radio".into()));
+        }
+
+        let registration = Proxy::new(conn, "org.ofono", "/ril_0", "org.ofono.NetworkRegistration").await?;
+        // Use ofono first so its own selection policy is updated as well.
+        let registered: zbus::Result<()> = match tokio::time::timeout(
+            Duration::from_secs(30), registration.call("Register", &()),
+        ).await {
+            Ok(result) => result,
+            Err(_) => Err(zbus::Error::Failure("Automatic registration request timed out".into())),
+        };
+        if let Err(error) = registered {
+            warn!("ofono automatic registration did not confirm success; checking Modem mode: {}", error);
+        }
+
+        ensure_automatic_selection(|command| {
+            let modem = &modem;
+            async move {
+                let timeout = if command == "AT+COPS=0" { 150 } else { 10 };
+                match tokio::time::timeout(Duration::from_secs(timeout),
+                    modem.call::<_, _, String>("SendAtcmd", &(command)),
+                ).await {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(_) => Err(format!("{command} timed out")),
+                }
+            }
+        }, || tokio::time::sleep(Duration::from_secs(2)))
+            .await.map_err(zbus::Error::Failure)
     }).await
 }
 
@@ -1919,5 +2020,80 @@ pub async fn switch_sim_slot(conn: &Connection, slot: u8) -> zbus::Result<String
         
         Ok(response)
     }).await
+}
+
+#[cfg(test)]
+mod operator_selection_tests {
+    use super::{ensure_automatic_selection, parse_cops_mode};
+    use std::{collections::VecDeque, future::{ready, Future}, task::{Context, Poll, Waker}};
+
+    fn run_script(script: Vec<(&'static str, Result<&'static str, &'static str>)>) -> Result<(), String> {
+        let mut script = VecDeque::from(script);
+        let result = {
+            let mut future = Box::pin(ensure_automatic_selection(|command| {
+                let (expected, result) = script.pop_front().expect("Unexpected Modem command");
+                assert_eq!(command, expected);
+                ready(result.map(str::to_string).map_err(str::to_string))
+            }, || ready(())));
+            let mut context = Context::from_waker(Waker::noop());
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(result) => result,
+                Poll::Pending => panic!("Scripted commands must complete immediately"),
+            }
+        };
+        assert!(script.is_empty(), "Not all expected Modem commands were used");
+        result
+    }
+
+    #[test]
+    fn parses_real_cops_responses_without_accepting_errors() {
+        assert_eq!(parse_cops_mode("\r\n+COPS: 0,0,\"HK CSL\",13\r\nOK\r\n"), Some(0));
+        assert_eq!(parse_cops_mode("+COPS: 1\nOK\n"), Some(1));
+        assert_eq!(parse_cops_mode("AT+COPS?\n+CEREG: 2,1\n+COPS: 0\nOK\n"), Some(0));
+        for response in ["+COPS: 0", "+COPS: 0\nERROR\n", "OK\n", "+COPS: bad\nOK\n", "+COPS: 99\nOK\n"] {
+            assert_eq!(parse_cops_mode(response), None);
+        }
+    }
+
+    #[test]
+    fn failed_command_with_confirmed_automatic_mode_succeeds() {
+        assert!(run_script(vec![
+            ("AT+COPS?", Ok("+COPS: 1\nOK\n")),
+            ("AT+COPS=0", Err("org.ofono.Error.Failed: Operation failed")),
+            ("AT+COPS?", Ok("+COPS: 1\nOK\n")),
+            ("AT+COPS?", Ok("+COPS: 0,0,\"HK CSL\",13\nOK\n")),
+        ]).is_ok());
+    }
+
+    #[test]
+    fn successful_command_without_mode_change_is_not_success() {
+        let mut script = vec![
+            ("AT+COPS?", Ok("+COPS: 1\nOK\n")),
+            ("AT+COPS=0", Ok("OK\n")),
+        ];
+        script.extend(std::iter::repeat_n(("AT+COPS?", Ok("+COPS: 1\nOK\n")), 6));
+        assert!(run_script(script).unwrap_err().contains("still reports mode 1"));
+    }
+
+    #[test]
+    fn automatic_mode_needs_no_extra_selection_command() {
+        assert!(run_script(vec![("AT+COPS?", Ok("+COPS: 0\nOK\n"))]).is_ok());
+    }
+
+    #[test]
+    fn unreadable_mode_is_not_treated_as_automatic() {
+        assert!(run_script(vec![("AT+COPS?", Err("AT interface unavailable")); 4]).is_err());
+    }
+
+    #[test]
+    fn transient_interface_loss_is_retried_without_repeating_selection() {
+        assert!(run_script(vec![
+            ("AT+COPS?", Err("AT interface unavailable")),
+            ("AT+COPS?", Ok("+COPS: 4\nOK\n")),
+            ("AT+COPS=0", Ok("OK\n")),
+            ("AT+COPS?", Err("AT interface restarting")),
+            ("AT+COPS?", Ok("+COPS: 0\nOK\n")),
+        ]).is_ok());
+    }
 }
 

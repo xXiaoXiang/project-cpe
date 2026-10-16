@@ -45,7 +45,7 @@ interface ProfileAction {
 }
 
 interface Notice {
-  severity: 'success' | 'error'
+  severity: 'success' | 'warning' | 'error'
   text: string
 }
 
@@ -58,6 +58,12 @@ const emptyDownloadRequest: EuiccDownloadRequest = {
 }
 
 const profileName = (profile: EuiccProfile) => profile.profileName || profile.serviceProviderName || profile.iccid
+const profileClasses: Record<string, { label: string; description: string }> = {
+  operational: { label: '业务配置', description: '用于日常上网、通话等正常通信业务的配置文件。' },
+  provisioning: { label: '引导配置', description: '通常用于提供下载和管理业务配置所需的初始网络连接。' },
+  test: { label: '测试配置', description: '用于测试和验证的配置文件。' },
+  unknown: { label: '未知', description: '未识别的配置文件类型。' },
+}
 
 export default function EuiccManagementPage() {
   const [euicc, setEuicc] = useState<EuiccInfo | null>(null)
@@ -121,9 +127,11 @@ export default function EuiccManagementPage() {
         if (response.status !== 'ok' || !response.data) {
           throw new Error(response.message || '未确认到目标 Profile 已启用')
         }
-        const { profiles } = response.data
+        const { profiles, network_selection_warning: selectionWarning } = response.data
         setEuicc((current) => (current ? { ...current, profiles } : current))
-        setNotice({ severity: 'success', text: 'Profile 已切换' })
+        setNotice(selectionWarning
+          ? { severity: 'warning', text: `Profile 已切换，但自动选网尚未确认：${selectionWarning}。请在运营商管理中重试自动注册。` }
+          : { severity: 'success', text: selectionWarning === null ? 'Profile 已切换，已恢复自动选网' : 'Profile 已切换' })
       } else {
         const response = await api.deleteEuiccProfile(action.profile.iccid)
         if (response.status !== 'ok') {
@@ -236,7 +244,7 @@ export default function EuiccManagementPage() {
     profile.profileState.toLowerCase() === 'enabled' && profile.iccid !== pendingAction?.profile.iccid)
 
   return (
-    <Box sx={{ p: { xs: 2, md: 3 }, maxWidth: 1200, mx: 'auto' }}>
+    <Box sx={{ minWidth: 0 }}>
       <Stack
         direction={{ xs: 'column', lg: 'row' }}
         alignItems={{ xs: 'stretch', lg: 'center' }}
@@ -296,7 +304,7 @@ export default function EuiccManagementPage() {
       </Stack>
 
       <Alert severity="warning" sx={{ mb: 2.5 }}>
-        切换 Profile 可能使蜂窝网络短暂中断。删除 Profile 不可撤销。
+        切换 Profile 后将恢复自动选网，蜂窝网络可能短暂中断。删除 Profile 不可撤销。
       </Alert>
 
       {euiccUnavailable && (
@@ -319,45 +327,47 @@ export default function EuiccManagementPage() {
         <Box
           sx={{
             display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 320px), 1fr))',
-            alignItems: 'start',
+            gridTemplateColumns: 'repeat(auto-fill, min(100%, 420px))',
+            alignItems: 'stretch',
             gap: 2,
           }}
         >
           {euicc.profiles.map((profile) => {
             const enabled = profile.profileState.toLowerCase() === 'enabled'
             const name = profile.profileName || profile.serviceProviderName || '未命名 Profile'
-            const provider = profile.serviceProviderName || profile.profileName
+            const provider = profile.serviceProviderName?.trim()
+            const profileClass = profile.profileClass ? profileClasses[profile.profileClass] : undefined
             const editing = nicknameEdit?.iccid === profile.iccid
             return (
-              <Card key={profile.iccid} variant="outlined" sx={{ borderRadius: 1, display: 'flex', flexDirection: 'column' }}>
+              <Card key={profile.iccid} data-profile={profile.iccid} variant="outlined" sx={{ borderRadius: 1, display: 'flex', flexDirection: 'column' }}>
                 <CardContent sx={{ p: 2, '&:last-child': { pb: 2 } }}>
                   <Stack direction="row" justifyContent="space-between" alignItems="flex-start" spacing={1}>
-                    <Box sx={{ minWidth: 0 }}>
-                      <Stack direction="row" alignItems="baseline" gap={0.75} flexWrap="wrap">
-                        <Typography variant="h6" component="h2" sx={{ overflowWrap: 'anywhere' }}>{name}</Typography>
-                        {!editing && profile.profileNickname && (
-                          <Typography variant="body2" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>{profile.profileNickname}</Typography>
+                    <Box sx={{ minWidth: 0, flex: 1 }}>
+                      <Stack direction="row" alignItems="center" gap={0.75} data-profile-heading sx={{ minWidth: 0 }}>
+                        <Typography variant="h6" component="h2" noWrap title={name} sx={{ fontWeight: 700, minWidth: 0 }}>{name}</Typography>
+                        {provider && provider !== name.trim() && (
+                          <Typography variant="body2" color="text.secondary" noWrap title={provider} sx={{ fontWeight: 400, minWidth: 0 }}>
+                            {provider}
+                          </Typography>
                         )}
-                        {!editing && <Tooltip title="编辑昵称"><span>
+                        {!editing && profile.profileNickname && (
+                          <Typography variant="body2" color="text.secondary" noWrap title={profile.profileNickname} sx={{ fontWeight: 400, minWidth: 0 }}>{profile.profileNickname}</Typography>
+                        )}
+                        {!editing && <Tooltip title="编辑昵称"><Box component="span" sx={{ flexShrink: 0 }}>
                           <IconButton size="small" aria-label={`编辑 ${name} 的昵称`} disabled={deviceBusy}
                             onClick={() => {
                               setNicknameEdit({ iccid: profile.iccid, value: profile.profileNickname || '' })
                               setNicknameError(null)
                             }}><EditOutlined fontSize="small" /></IconButton>
-                        </span></Tooltip>}
+                        </Box></Tooltip>}
                       </Stack>
-                      {provider && provider !== name && (
-                        <Typography variant="body2" color="text.secondary" sx={{ mt: 0.25 }}>
-                          {provider}
-                        </Typography>
-                      )}
                     </Box>
                     <Chip
                       size="small"
                       label={enabled ? '已启用' : '已停用'}
                       color={enabled ? 'success' : 'default'}
                       variant={enabled ? 'filled' : 'outlined'}
+                      sx={{ flexShrink: 0 }}
                     />
                   </Stack>
                   {editing && nicknameEdit && (
@@ -379,15 +389,17 @@ export default function EuiccManagementPage() {
                   )}
                   <Stack direction="row" alignItems="center" spacing={1.5} sx={{ mt: 1.5 }}>
                     <Stack spacing={0.75} sx={{ flex: 1, minWidth: 0 }}>
-                    <Typography variant="caption" color="text.secondary">ICCID</Typography>
-                    <Typography variant="body2" sx={{ fontFamily: 'monospace', overflowWrap: 'anywhere' }}>
-                      {profile.iccid}
-                    </Typography>
-                    {profile.profileClass && (
-                      <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                        类型：{profile.profileClass}
+                      <Typography variant="body2" sx={{ fontSize: '0.75rem', overflowWrap: 'anywhere' }}>
+                        <Box component="span" sx={{ color: 'text.secondary', whiteSpace: 'nowrap' }}>ICCID：</Box>
+                        <Box component="span" sx={{ fontFamily: 'monospace' }}>{profile.iccid}</Box>
                       </Typography>
-                    )}
+                      {profile.profileClass && (
+                        <Tooltip title={profileClass?.description ?? ''}>
+                          <Typography variant="body2" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>
+                            类型：{profileClass ? `${profileClass.label}（${profile.profileClass}）` : profile.profileClass}
+                          </Typography>
+                        </Tooltip>
+                      )}
                     </Stack>
                     <Stack spacing={0.5} sx={{ flexShrink: 0 }}>
                       <Button size="small" startIcon={<PowerSettingsNew />} aria-label={`启用 ${name}`}

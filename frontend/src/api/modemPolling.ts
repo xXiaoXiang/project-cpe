@@ -1,11 +1,11 @@
 import type { AirplaneModeResponse, ApiResponse, NetworkInfo } from './types.ts'
 
-// Cached property reads remain independent of slow AT commands. Only radio
-// dependent diagnostics require registration; SIM reads also work without it.
-const diagnostics = new Set(['/cells', '/qos', '/location/cell-info'])
+// Radio diagnostics and IMS wait for stable registration; SIM reads also work
+// without registration. Other property reads remain independent of slow AT commands.
+const diagnostics = new Set(['/cells', '/qos', '/location/cell-info', '/ims/status'])
 const modemReads = new Set([
   ...diagnostics, '/sim', '/sim/slot', '/device/imeisv', '/data', '/roaming',
-  '/ims/status', '/radio-mode', '/band-lock', '/cell-lock', '/apn',
+  '/radio-mode', '/band-lock', '/cell-lock', '/apn',
   '/network/operators', '/network/signal-strength', '/network/nitz',
 ])
 const transitions = new Set([
@@ -48,6 +48,12 @@ export function createModemReadPolicy(now = Date.now) {
       return deferred('Modem 正忙，稍后自动重试', blockedUntil - now())
     }
     if (result.status === 'deferred') return deferred('Modem 状态正在恢复，稍后自动重试', result.retry_after_ms)
+    // Older backends report a temporarily missing IMS interface as an error.
+    // Back off this endpoint without hiding unrelated DBus/permission failures.
+    if (url === '/ims/status' && /UnknownMethod|UnknownInterface/.test(result.message ?? '')
+      && result.message?.includes('org.ofono.IpMultimediaSystem')) {
+      return deferred('等待 IMS 接口恢复')
+    }
     return undefined
   }
   const observe = (url: string, result: ApiResponse<unknown>) => {
