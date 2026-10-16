@@ -23,7 +23,7 @@ use crate::models::{
     AirplaneModeResponse, ApnContext, DeviceInfoResponse, NetworkInfoResponse, QosInfoResponse, RadioMode,
     RadioModeResponse, ServingCell, SimInfoResponse,
 };
-use crate::serial::with_serial;
+use crate::serial::{with_modem_read, with_serial};
 use crate::state::FrontendRuntime;
 
 /// ofono NetworkMonitor 代理接口
@@ -140,6 +140,22 @@ pub async fn send_at_command(conn: &Connection, cmd: &str) -> zbus::Result<Strin
     }).await
 }
 
+/// Background AT reads share the command lock and busy backoff with SIM/cell reads.
+pub async fn send_at_read_command(conn: &Connection, cmd: &str) -> zbus::Result<String> {
+    with_modem_read(cmd, async {
+        let proxy = Proxy::new(conn, "org.ofono", "/ril_0", "org.ofono.Modem").await?;
+        proxy.call("SendAtcmd", &(cmd)).await
+    }).await
+}
+
+async fn require_registered_network(conn: &Connection) -> zbus::Result<()> {
+    let network = get_network_info_data(conn).await?;
+    if !matches!(network.registration_status.as_str(), "registered" | "roaming") {
+        return Err(zbus::Error::Failure("ModemReadDeferred: waiting for network registration".into()));
+    }
+    Ok(())
+}
+
 /// 获取服务小区信息
 ///
 /// # Arguments
@@ -148,7 +164,8 @@ pub async fn send_at_command(conn: &Connection, cmd: &str) -> zbus::Result<Strin
 /// # Returns
 /// 服务小区信息结构
 pub async fn get_serving_cell_info(conn: &Connection) -> zbus::Result<ServingCell> {
-    with_serial(async {
+    require_registered_network(conn).await?;
+    with_modem_read("serving-cell", async {
         let proxy = NetworkMonitorProxy::new(conn).await?;
         let cell_info: HashMap<String, OwnedValue> = proxy.get_serving_cell_information().await?;
 
@@ -156,6 +173,9 @@ pub async fn get_serving_cell_info(conn: &Connection) -> zbus::Result<ServingCel
             .get("Technology")
             .and_then(|v| String::try_from(v.clone()).ok())
             .unwrap_or_else(|| "unknown".to_string());
+        if tech.is_empty() || tech.eq_ignore_ascii_case("unknown") {
+            return Err(zbus::Error::Failure("ModemReadDeferred: waiting for serving cell technology".into()));
+        }
 
         let cell_id = parse_u32_from_keys(&cell_info, &["NCellId", "CellId", "NRCellID"]);
         let tac = parse_u32_from_keys(&cell_info, &["TrackingAreaCode"]);
@@ -798,6 +818,7 @@ pub async fn data_connection_watchdog(
 /// # Returns
 /// SIM 卡信息结构（整合 SimManager + MessageManager）
 pub async fn get_sim_info_data(conn: &Connection) -> zbus::Result<SimInfoResponse> {
+    with_modem_read("sim", async {
     let sim_proxy = SimManagerProxy::new(conn).await?;
     let msg_proxy = MessageManagerProxy::new(conn).await?;
     
@@ -868,10 +889,12 @@ pub async fn get_sim_info_data(conn: &Connection) -> zbus::Result<SimInfoRespons
         pin_required,
         preferred_languages,
     })
+    }).await
 }
 
 /// 请求 Modem 刷新当前 SIM/eUICC 状态
 pub async fn refresh_sim(conn: &Connection) -> zbus::Result<()> {
+    let _modem_change = crate::serial::modem_change();
     with_serial(async {
         let proxy = SimManagerProxy::new(conn).await?;
         proxy.sim_refresh().await
@@ -897,11 +920,39 @@ pub async fn get_registered_mcc(conn: &Connection) -> Option<String> {
 /// # Returns
 /// 网络信息结构
 pub async fn get_network_info_data(conn: &Connection) -> zbus::Result<NetworkInfoResponse> {
+    let modem = ModemProxy::new(conn).await?;
+    let props = modem.get_properties().await?;
+    let powered = props.get("Powered").and_then(|v| bool::try_from(v.clone()).ok()).unwrap_or(false);
+    let online = props.get("Online").and_then(|v| bool::try_from(v.clone()).ok()).unwrap_or(false);
+    if !powered || !online {
+        return Ok(NetworkInfoResponse {
+            registration_status: if powered { "offline" } else { "powered-off" }.into(),
+            ..Default::default()
+        });
+    }
+    let interfaces = props.get("Interfaces")
+        .and_then(|v| Vec::<String>::try_from(v.clone()).ok());
+    if interfaces.as_ref().is_some_and(|items| !items.iter().any(|item| item == "org.ofono.NetworkRegistration")) {
+        return Ok(NetworkInfoResponse { registration_status: "initializing".into(), ..Default::default() });
+    }
     let net_proxy = NetworkRegistrationProxy::new(conn).await?;
     let radio_proxy = RadioSettingsProxy::new(conn).await?;
     
-    let net_props = net_proxy.get_properties().await?;
-    let radio_props = radio_proxy.get_properties().await?;
+    let net_props = match net_proxy.get_properties().await {
+        Ok(properties) => properties,
+        Err(error) if error.to_string().contains("UnknownMethod") || error.to_string().contains("UnknownInterface") => {
+            // Interfaces may disappear between the Modem snapshot and this call.
+            return Err(zbus::Error::Failure("ModemReadDeferred: network interface is restarting".into()));
+        }
+        Err(error) => return Err(error),
+    };
+    let radio_props = if interfaces.as_ref().is_none_or(|items| items.iter().any(|item| item == "org.ofono.RadioSettings")) {
+        match radio_proxy.get_properties().await {
+            Ok(properties) => properties,
+            Err(error) if error.to_string().contains("UnknownMethod") || error.to_string().contains("UnknownInterface") => HashMap::new(),
+            Err(error) => return Err(error),
+        }
+    } else { HashMap::new() };
 
     let operator_name = net_props
         .get("Name")
@@ -935,6 +986,7 @@ pub async fn get_network_info_data(conn: &Connection) -> zbus::Result<NetworkInf
         operator_name,
         registration_status,
         technology_preference,
+        technology: net_props.get("Technology").and_then(|v| String::try_from(v.clone()).ok()).unwrap_or_default(),
         signal_strength,
         mcc,
         mnc,
@@ -999,7 +1051,8 @@ pub async fn get_device_info_data(conn: &Connection) -> zbus::Result<DeviceInfoR
 /// # Returns
 /// QoS信息结构
 pub async fn get_qos_info_data(conn: &Connection) -> zbus::Result<QosInfoResponse> {
-    let response = send_at_command(conn, "AT+CGEQOSRDP").await?;
+    require_registered_network(conn).await?;
+    let response = send_at_read_command(conn, "AT+CGEQOSRDP").await?;
     
     // 解析 +CGEQOSRDP: <cid>,<QCI>,[<DL_GBR>,<UL_GBR>],[<DL_MBR>,<UL_MBR>],[<DL_AMBR>,<UL_AMBR>]
     let parsed = parse_qos_response(&response);
@@ -1094,6 +1147,7 @@ fn parse_u32_from_keys(cell_info: &HashMap<String, OwnedValue>, keys: &[&str]) -
 /// - Online = false: 关闭射频，进入飞行模式（但 Modem 保持上电）
 /// - Online = true: 开启射频，退出飞行模式
 pub async fn set_airplane_mode(conn: &Connection, enabled: bool) -> zbus::Result<()> {
+    let _modem_change = crate::serial::modem_change();
     with_serial(async {
         let proxy = ModemProxy::new(conn).await?;
         
@@ -1847,6 +1901,7 @@ pub async fn get_sim_slot(conn: &Connection) -> zbus::Result<SimSlotResponse> {
 
 /// 切换 SIM 卡槽
 pub async fn switch_sim_slot(conn: &Connection, slot: u8) -> zbus::Result<String> {
+    let _modem_change = crate::serial::modem_change();
     with_serial(async {
         let proxy = Proxy::new(conn, "org.ofono", "/ril_0", "org.ofono.Modem").await?;
         

@@ -26,6 +26,7 @@ import type {
   AirplaneModeResponse,
   ImsStatusResponse,
   RoamingResponse,
+  ApiResponse,
 } from '@/api/types'
 
 export const SPEED_HISTORY_MAX_POINTS = 30
@@ -64,11 +65,16 @@ export interface DashboardActions {
   loadData: () => Promise<void>
 }
 
+export interface PendingControl {
+  control: 'data' | 'airplane' | 'roaming'
+  target: boolean
+}
+
 const CONNECTIVITY_MIN_REFRESH_INTERVAL = 15_000
 const CONNECTIVITY_HIDDEN_MIN_REFRESH_INTERVAL = 60_000
 
 export function useDashboardData(refreshInterval: number, refreshKey: number) {
-  const { initialLoading, error, setError, fetchInto } = useApiRequests()
+  const { initialLoading, error, setError, fetchInto, waitingMessage } = useApiRequests()
 
   const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null)
   const [simInfo, setSimInfo] = useState<SimInfo | null>(null)
@@ -81,6 +87,9 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
   const [imsStatus, setImsStatus] = useState<ImsStatusResponse | null>(null)
   const [connectivity, setConnectivity] = useState<ConnectivityResult | null>(null)
   const [roaming, setRoaming] = useState<RoamingResponse | null>(null)
+  const [pendingControl, setPendingControl] = useState<PendingControl | null>(null)
+  const pendingControlRef = useRef<PendingControl | null>(null)
+  const controlRevision = useRef(0)
 
   const [speedHistory, setSpeedHistory] = useState<Record<string, InterfaceSpeedHistory>>({})
   const speedHistoryRef = useRef<Record<string, InterfaceSpeedHistory>>({})
@@ -124,20 +133,26 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
   )
 
   const loadData = useCallback(async () => {
+    const revision = controlRevision.current
+    const applyControl = <T,>(apply: (data: T) => void) => (data: T) => {
+      // A polling response started before/during a write must not overwrite its
+      // confirmed result, even if the response body finishes after the write.
+      if (!pendingControlRef.current && revision === controlRevision.current) apply(data)
+    }
     await Promise.allSettled([
       fetchInto('device', '设备信息', () => api.getDeviceInfo(), setDeviceInfo),
-      fetchInto('sim', 'SIM 信息', () => api.getSimInfo(), setSimInfo),
+      fetchInto('sim', 'SIM 信息', () => api.getSimInfo(), setSimInfo, () => setSimInfo(null)),
       fetchInto('stats', '系统状态', () => api.getSystemStats(), (stats) => {
         setSystemStats(stats)
         updateSpeedHistory(stats)
       }),
-      fetchInto('network', '网络信息', () => api.getNetworkInfo(), setNetworkInfo),
-      fetchInto('data', '数据连接状态', () => api.getDataStatus(), (status) => setDataStatus(status.active)),
-      fetchInto('cells', '小区信息', () => api.getCellsInfo(), setCellsInfo),
-      fetchInto('qos', 'QoS 信息', () => api.getQosInfo(), setQosInfo),
-      fetchInto('airplane', '飞行模式状态', () => api.getAirplaneMode(), setAirplaneMode),
+      fetchInto('network', '网络信息', () => api.getNetworkInfo(), setNetworkInfo, () => setNetworkInfo(null)),
+      pendingControlRef.current ? Promise.resolve() : fetchInto('data', '数据连接状态', () => api.getDataStatus(), applyControl((status) => setDataStatus(status.active))),
+      fetchInto('cells', '小区信息', () => api.getCellsInfo(), setCellsInfo, () => setCellsInfo(null)),
+      fetchInto('qos', 'QoS 信息', () => api.getQosInfo(), setQosInfo, () => setQosInfo(null)),
+      pendingControlRef.current ? Promise.resolve() : fetchInto('airplane', '飞行模式状态', () => api.getAirplaneMode(), applyControl(setAirplaneMode)),
       fetchInto('ims', 'IMS 状态', () => api.getImsStatus(), setImsStatus),
-      fetchInto('roaming', '漫游状态', () => api.getRoamingStatus(), setRoaming),
+      pendingControlRef.current ? Promise.resolve() : fetchInto('roaming', '漫游状态', () => api.getRoamingStatus(), applyControl(setRoaming)),
     ])
   }, [fetchInto, updateSpeedHistory])
 
@@ -145,45 +160,47 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
     await fetchInto('connectivity', '连通性检测', () => api.getConnectivity(), setConnectivity)
   }, [fetchInto])
 
-  const toggleData = useCallback(async () => {
-    if (dataStatus === null) return
-
+  const changeControl = useCallback(async <T,>(
+    control: PendingControl['control'],
+    target: boolean,
+    request: () => Promise<ApiResponse<T>>,
+    apply: (data: T) => void,
+  ) => {
+    if (pendingControlRef.current) return
+    const pending = { control, target }
+    pendingControlRef.current = pending
+    controlRevision.current++
+    setPendingControl(pending)
+    setError(null)
     try {
-      const newStatus = !dataStatus
-      await api.setDataStatus(newStatus)
-      setDataStatus(newStatus)
+      const response = await request()
+      if (response.status !== 'ok' || response.data === undefined || response.data === null) {
+        throw new Error(response.message || '设备未确认操作结果，请重试')
+      }
+      apply(response.data)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      controlRevision.current++
+      pendingControlRef.current = null
+      setPendingControl(null)
     }
-  }, [dataStatus, setError])
+  }, [setError])
+
+  const toggleData = useCallback(async () => {
+    if (dataStatus === null) return
+    await changeControl('data', !dataStatus, () => api.setDataStatus(!dataStatus), (status) => setDataStatus(status.active))
+  }, [dataStatus, changeControl])
 
   const toggleAirplaneMode = useCallback(async () => {
     if (!airplaneMode) return
-
-    try {
-      const newEnabled = !airplaneMode.enabled
-      const response = await api.setAirplaneMode(newEnabled)
-      if (response.data) {
-        setAirplaneMode(response.data)
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    }
-  }, [airplaneMode, setError])
+    await changeControl('airplane', !airplaneMode.enabled, () => api.setAirplaneMode(!airplaneMode.enabled), setAirplaneMode)
+  }, [airplaneMode, changeControl])
 
   const toggleRoaming = useCallback(async () => {
     if (!roaming) return
-
-    try {
-      const newAllowed = !roaming.roaming_allowed
-      const response = await api.setRoamingAllowed(newAllowed)
-      if (response.data) {
-        setRoaming(response.data)
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    }
-  }, [roaming, setError])
+    await changeControl('roaming', !roaming.roaming_allowed, () => api.setRoamingAllowed(!roaming.roaming_allowed), setRoaming)
+  }, [roaming, changeControl])
 
   useAdaptivePolling({
     refreshInterval,
@@ -201,14 +218,16 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
     initialLoading,
     error,
     setError,
+    waitingMessage,
+    pendingControl,
     data: {
       deviceInfo,
       simInfo,
       systemStats,
       networkInfo,
       dataStatus,
-      cellsInfo,
-      qosInfo,
+      cellsInfo: airplaneMode?.enabled || !['registered', 'roaming'].includes(networkInfo?.registration_status ?? '') ? null : cellsInfo,
+      qosInfo: airplaneMode?.enabled || !['registered', 'roaming'].includes(networkInfo?.registration_status ?? '') ? null : qosInfo,
       airplaneMode,
       imsStatus,
       connectivity,

@@ -34,7 +34,7 @@ use crate::{
     dbus::{
         get_airplane_mode, get_all_apn_contexts, get_data_connection_status, get_device_info_data,
         get_network_info_data, get_qos_info_data, get_radio_mode, get_roaming_status, get_serving_cell_info,
-        get_sim_info_data, send_at_command, set_airplane_mode, set_apn_properties, set_data_connection,
+        get_sim_info_data, send_at_command, send_at_read_command, set_airplane_mode, set_apn_properties, set_data_connection,
         set_radio_mode, set_roaming_allowed,
     },
     iptables::flush_iptables,
@@ -200,6 +200,8 @@ pub async fn enable_euicc_profile(
     if let Err(error) = validate_euicc_identifier(&request.iccid) {
         return euicc_failure(error);
     }
+
+    let _modem_change = crate::serial::modem_change();
 
     let args = vec![
         "profile".to_string(),
@@ -580,7 +582,7 @@ async fn fetch_primary_cell(
     cmd: &str,
     tech: &str,
 ) -> Result<CellInfo, String> {
-    let response = send_at_command(conn, cmd)
+    let response = send_at_read_command(conn, cmd)
         .await
         .map_err(|e| format!("Primary cell AT command failed: {}", e))?;
 
@@ -604,7 +606,7 @@ async fn fetch_neighbor_cells(
     cmd: &str,
     tech: &str,
 ) -> Result<Vec<CellInfo>, String> {
-    let response = send_at_command(conn, cmd)
+    let response = send_at_read_command(conn, cmd)
         .await
         .map_err(|e| format!("Neighbor cell AT command failed: {}", e))?;
 
@@ -729,6 +731,7 @@ pub async fn set_data_status(
     State(conn): State<Arc<Connection>>,
     Json(payload): Json<DataConnectionRequest>,
 ) -> impl IntoResponse {
+    let _modem_change = crate::serial::modem_change();
     // 1. 先清空 iptables 规则
     if let Err(_e) = flush_iptables().await {
         // 清空规则失败不应阻止数据连接操作，静默处理
@@ -845,6 +848,7 @@ pub async fn set_roaming_status_handler(
     State(conn): State<Arc<Connection>>,
     Json(payload): Json<RoamingRequest>,
 ) -> impl IntoResponse {
+    let _modem_change = crate::serial::modem_change();
     match set_roaming_allowed(&conn, payload.allowed).await {
         Ok(_) => {
             // Read back the status to confirm
@@ -907,6 +911,7 @@ pub async fn set_airplane_mode_handler(
     State(conn): State<Arc<Connection>>,
     Json(payload): Json<AirplaneModeRequest>,
 ) -> impl IntoResponse {
+    let _modem_change = crate::serial::modem_change();
     match set_airplane_mode(&conn, payload.enabled).await {
         Ok(_) => {
             // 读取当前状态确认

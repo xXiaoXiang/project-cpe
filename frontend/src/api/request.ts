@@ -1,6 +1,10 @@
 import { createSingleFlight } from '../utils/singleFlight.ts'
+import type { ApiResponse } from './types.ts'
+import { createModemReadPolicy, isManagedModemRead, isModemTransition } from './modemPolling.ts'
 
 const pendingReads = createSingleFlight()
+const policy = createModemReadPolicy()
+const rawReads = createSingleFlight()
 
 export function request<T>(
   url: string,
@@ -24,7 +28,19 @@ export function request<T>(
   // Writes and requests with caller-owned cancellation remain independent.
   if ((options.method ?? 'GET').toUpperCase() === 'GET'
     && !options.signal && !options.body && !options.headers) {
-    return pendingReads(`${url}:${returnText ? 'text' : 'json'}:${options.cache ?? 'default'}`, performRequest)
+    return pendingReads(`${url}:${returnText ? 'text' : 'json'}:${options.cache ?? 'default'}`, () => {
+      if (returnText || !isManagedModemRead(url)) return performRequest()
+      return policy.read<T>(url, (path) => rawReads(`${path}:${options.cache ?? 'default'}`, async () => {
+        if (path === url) return await performRequest() as ApiResponse<unknown>
+        const response = await fetch(`/api${path}`, { headers: { 'Content-Type': 'application/json' } })
+        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`)
+        return await response.json() as ApiResponse<unknown>
+      }))
+    })
+  }
+  if ((options.method ?? 'GET').toUpperCase() !== 'GET' && isModemTransition(url)) {
+    policy.beginTransition()
+    return performRequest().finally(() => policy.endTransition())
   }
   return performRequest()
 }

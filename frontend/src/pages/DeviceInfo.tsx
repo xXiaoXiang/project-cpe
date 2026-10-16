@@ -9,7 +9,7 @@
  * Copyright (c) 2025 by 1orz, All Rights Reserved. 
  */
 import { useCallback, useState } from 'react'
-import { useRevealAll } from '../contexts/revealSensitive'
+import { useSensitiveVisibility } from '../contexts/revealSensitive'
 import {
   Box,
   Typography,
@@ -47,14 +47,11 @@ import type { DeviceInfo, SimInfo, SimSlotResponse, ImeisvResponse } from '../ap
 
 export default function DeviceInfoPage() {
   const { refreshInterval, refreshKey } = useRefreshInterval()
-  const { initialLoading: loading, error, setError, fetchInto } = useApiRequests()
+  const { initialLoading: loading, error, setError, fetchInto, waitingMessage } = useApiRequests()
   const [success, setSuccess] = useState<string | null>(null)
   // 每个功能块独立的敏感信息显示状态
-  const revealAll = useRevealAll()
-  const [localShowDeviceId, setShowDeviceId] = useState(false)
-  const [localShowSimInfo, setShowSimInfo] = useState(false)
-  const showDeviceId = localShowDeviceId || revealAll
-  const showSimInfo = localShowSimInfo || revealAll
+  const [showDeviceId, setShowDeviceId] = useSensitiveVisibility()
+  const [showSimInfo, setShowSimInfo] = useSensitiveVisibility()
   
   // 设备信息（包含 online, powered, manufacturer, model）
   const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null)
@@ -69,7 +66,7 @@ export default function DeviceInfoPage() {
   const loadData = useCallback(async () => {
     await Promise.allSettled([
       fetchInto('device', '设备信息', () => api.getDeviceInfo(), setDeviceInfo),
-      fetchInto('sim', 'SIM 信息', () => api.getSimInfo(), setSimInfo),
+      fetchInto('sim', 'SIM 信息', () => api.getSimInfo(), setSimInfo, () => setSimInfo(null)),
       fetchInto('imeisv', 'IMEISV', () => api.getImeisv(), setImeisv),
       fetchInto('slot', 'SIM 卡槽', () => api.getSimSlot(), setSimSlot),
     ])
@@ -119,6 +116,7 @@ export default function DeviceInfoPage() {
   return (
     <Box>
       {/* 页面标题 */}
+      {waitingMessage && <Alert severity="info" sx={{ mb: 2 }}>{waitingMessage}</Alert>}
       <Box mb={3}>
         <Typography variant="h4" gutterBottom fontWeight={600}>
           设备信息

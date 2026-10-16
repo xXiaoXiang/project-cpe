@@ -8,10 +8,9 @@
  *
  * Copyright (c) 2025 by 1orz, All Rights Reserved.
  */
-import { useState } from 'react'
 import { Box, Card, CardContent, Typography, Stack, Chip, IconButton, Tooltip } from '@mui/material'
 import { SimCard, Visibility, VisibilityOff, Phone, Sms, Language } from '@mui/icons-material'
-import { useRevealAll } from '../../../contexts/revealSensitive'
+import { useSensitiveVisibility } from '../../../contexts/revealSensitive'
 import { getSensitiveStyle } from '../utils'
 import type { SimInfo } from '@/api/types'
 
@@ -20,9 +19,7 @@ interface SimCardInfoProps {
 }
 
 export function SimCardInfo({ simInfo }: SimCardInfoProps) {
-  const [localShowInfo, setShowInfo] = useState(false)
-  const revealAll = useRevealAll()
-  const showInfo = localShowInfo || revealAll
+  const [showInfo, setShowInfo] = useSensitiveVisibility()
 
   return (
     <Card sx={{ height: '100%' }}>
@@ -33,8 +30,8 @@ export function SimCardInfo({ simInfo }: SimCardInfoProps) {
             SIM 卡信息
           </Typography>
           <Chip
-            label={simInfo?.present ? '已插入' : '未插入'}
-            color={simInfo?.present ? 'success' : 'error'}
+            label={!simInfo ? '等待 SIM 信息' : simInfo.present ? '已插入' : '未插入'}
+            color={!simInfo ? 'default' : simInfo.present ? 'success' : 'error'}
             size="small"
             variant="outlined"
             sx={{ ml: 'auto' }}

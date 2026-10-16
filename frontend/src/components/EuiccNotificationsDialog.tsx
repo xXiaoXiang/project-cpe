@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useState } from 'react'
 import {
-  Alert, Box, Button, Card, CardContent, CircularProgress, Dialog, DialogActions,
-  DialogContent, DialogContentText, DialogTitle, IconButton, Stack, Tooltip, Typography,
+  Alert, Box, Button, ButtonBase, Card, CardActions, CardContent, CircularProgress, Collapse,
+  Dialog, DialogActions, DialogContent, DialogContentText, DialogTitle, Stack, Typography,
 } from '@mui/material'
-import { DeleteOutline, Refresh, Send } from '@mui/icons-material'
+import { DeleteOutline, ExpandMore, Refresh, Send } from '@mui/icons-material'
 import { api } from '@/api'
 import type { EuiccNotification, EuiccNotificationTarget } from '@/api/types'
 import { useSingleFlight } from '../hooks/useSingleFlight'
@@ -19,6 +19,7 @@ export default function EuiccNotificationsDialog({ onClose }: { onClose: () => v
   const [busy, setBusy] = useState<string | null>(null)
   const [feedback, setFeedback] = useState<{ severity: 'success' | 'error' | 'warning'; text: string } | null>(null)
   const [pendingRemoval, setPendingRemoval] = useState<EuiccNotification | null>(null)
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set())
   const run = useSingleFlight()
   const load = useCallback(() => run('notifications', async () => {
     setLoading(true)
@@ -72,26 +73,19 @@ export default function EuiccNotificationsDialog({ onClose }: { onClose: () => v
     group.push(notification)
     groups.set(notification.iccid, group)
   }
+  const toggleGroup = (iccid: string) => setCollapsedGroups((current) => {
+    const next = new Set(current)
+    if (next.has(iccid)) next.delete(iccid)
+    else next.add(iccid)
+    return next
+  })
+
   return (
     <>
       <Dialog open onClose={() => !busy && onClose()} fullWidth maxWidth="sm"
-        slotProps={{ paper: { sx: { width: 500, height: 'min(80vh, 760px)' } } }}>
-        <DialogTitle component="div">
-          <Stack direction="row" alignItems="center" justifyContent="space-between" gap={1} flexWrap="wrap">
-            <Typography component="h2" variant="h6">通知管理</Typography>
-            <Stack direction="row" spacing={0.5}>
-              <Button size="small" disabled={disabled || !notifications.length}
-                onClick={() => void act('process', { all: true })}>
-                {busy === 'process:all' && <CircularProgress size={14} sx={{ mr: 0.5 }} />}全部发送
-              </Button>
-              <Button size="small" color="error" disabled={disabled || !notifications.some(safeToRemove)}
-                onClick={() => void act('remove', { all: true })}>
-                {busy === 'remove:all' && <CircularProgress size={14} sx={{ mr: 0.5 }} />}全部删除
-              </Button>
-            </Stack>
-          </Stack>
-        </DialogTitle>
-        <DialogContent dividers>
+        slotProps={{ paper: { sx: { width: 600, height: 'min(80vh, 760px)' } } }}>
+        <DialogTitle>通知管理</DialogTitle>
+        <DialogContent dividers sx={{ px: { xs: 2, sm: 3 } }}>
           <Stack spacing={1.5}>
             <Typography variant="body2" color="text.secondary">
               发送后保留通知记录。“全部删除”仅删除 enable / disable 通知。
@@ -100,43 +94,68 @@ export default function EuiccNotificationsDialog({ onClose }: { onClose: () => v
             {loadError && <Alert severity="error">{loadError}</Alert>}
             {loading && <Box sx={{ textAlign: 'center', py: 2 }}><CircularProgress size={24} aria-label="正在读取通知" /></Box>}
             {!loading && !loadError && !notifications.length && <Alert severity="info">没有待处理的通知。</Alert>}
-            {Array.from(groups, ([iccid, items]) => (
-              <Box component="section" key={iccid} data-notification-group={iccid} aria-label={`ICCID ${iccid}`}
-                sx={{ border: 1, borderColor: 'divider', borderRadius: 1.5, p: 1.5, bgcolor: 'action.hover' }}>
-                <Typography variant="caption" color="text.secondary">ICCID</Typography>
-                <Typography variant="body2" sx={{ fontFamily: 'monospace', overflowWrap: 'anywhere', mb: 1.5 }}>{iccid}</Typography>
-                <Stack spacing={1}>
-                  {items.map((notification) => (
-              <Card key={notification.seqNumber} variant="outlined" data-notification={notification.seqNumber}>
-                <CardContent sx={{ display: 'flex', gap: 1.5, alignItems: 'center', '&:last-child': { pb: 2 } }}>
-                  <Stack spacing={0.75} sx={{ flex: 1, minWidth: 0 }}>
-                    <Typography fontWeight={600}>通知 #{notification.seqNumber}</Typography>
-                    <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
-                      操作：{notification.profileManagementOperation}
-                      {operationLabels[notification.profileManagementOperation] || ''}
+            {Array.from(groups, ([iccid, items]) => {
+              const expanded = !collapsedGroups.has(iccid)
+              const contentId = `euicc-notifications-${iccid}`
+              return (
+                <Box component="section" key={iccid} data-notification-group={iccid} aria-label={`ICCID ${iccid}`}>
+                  <ButtonBase onClick={() => toggleGroup(iccid)} aria-expanded={expanded} aria-controls={contentId}
+                    aria-label={`${expanded ? '折叠' : '展开'} ICCID ${iccid} 的通知`} title={`ICCID：${iccid}`}
+                    sx={{ display: 'flex', width: '100%', gap: 1, py: 0.75, mb: expanded ? 1 : 0, borderRadius: 1,
+                      '&.Mui-focusVisible': { outline: '2px solid', outlineColor: 'primary.main' } }}>
+                    <Box aria-hidden sx={{ flex: 1, minWidth: 8, borderTop: 1, borderColor: 'divider' }} />
+                    <Typography component="span" variant="body2" noWrap
+                      sx={{ fontWeight: 700, fontFamily: 'monospace', fontSize: { xs: '0.78rem', sm: '0.85rem' }, minWidth: 0 }}>
+                      ICCID：{iccid}
                     </Typography>
-                  </Stack>
-                  <Stack spacing={1}>
-                    <Tooltip title="发送通知">
-                      <span><IconButton aria-label={`发送通知 ${notification.seqNumber}`} color="primary" disabled={disabled}
-                        onClick={() => void act('process', { seq_number: notification.seqNumber })}>
-                        {busy === `process:${notification.seqNumber}` ? <CircularProgress size={20} /> : <Send />}
-                      </IconButton></span>
-                    </Tooltip>
-                    <Tooltip title="删除通知">
-                      <span><IconButton aria-label={`删除通知 ${notification.seqNumber}`} color="error" disabled={disabled}
-                        onClick={() => safeToRemove(notification)
-                          ? void act('remove', { seq_number: notification.seqNumber }) : setPendingRemoval(notification)}>
-                        {busy === `remove:${notification.seqNumber}` ? <CircularProgress size={20} /> : <DeleteOutline />}
-                      </IconButton></span>
-                    </Tooltip>
-                  </Stack>
-                </CardContent>
-              </Card>
-                  ))}
-                </Stack>
-              </Box>
-            ))}
+                    <ExpandMore fontSize="small" sx={{ flexShrink: 0, transform: expanded ? 'none' : 'rotate(-90deg)' }} />
+                    <Box aria-hidden sx={{ flex: 1, minWidth: 8, borderTop: 1, borderColor: 'divider' }} />
+                  </ButtonBase>
+                  <Collapse in={expanded} unmountOnExit id={contentId}>
+                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr)', sm: 'repeat(2, minmax(0, 1fr))' }, gap: 1 }}>
+                      {items.map((notification) => (
+                        <Card key={notification.seqNumber} variant="outlined" data-notification={notification.seqNumber}
+                          sx={{ display: 'flex', flexDirection: 'column' }}>
+                          <CardContent sx={{ p: 1.5, pb: 0.75, flex: 1 }}>
+                            <Typography variant="body2" fontWeight={600} sx={{ mb: 0.5 }}>通知 #{notification.seqNumber}</Typography>
+                            <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
+                              操作：{notification.profileManagementOperation}
+                              {operationLabels[notification.profileManagementOperation] || ''}
+                            </Typography>
+                          </CardContent>
+                          <CardActions sx={{ px: 1, pb: 1, pt: 0, justifyContent: 'flex-end' }}>
+                            <Button size="small" aria-label={`发送通知 ${notification.seqNumber}`} disabled={disabled}
+                              startIcon={busy === `process:${notification.seqNumber}` ? <CircularProgress size={16} /> : <Send />}
+                              onClick={() => void act('process', { seq_number: notification.seqNumber })}>
+                              发送
+                            </Button>
+                            <Button size="small" aria-label={`删除通知 ${notification.seqNumber}`} color="error" disabled={disabled}
+                              startIcon={busy === `remove:${notification.seqNumber}` ? <CircularProgress size={16} /> : <DeleteOutline />}
+                              onClick={() => safeToRemove(notification)
+                                ? void act('remove', { seq_number: notification.seqNumber }) : setPendingRemoval(notification)}>
+                              删除
+                            </Button>
+                          </CardActions>
+                        </Card>
+                      ))}
+                    </Box>
+                  </Collapse>
+                </Box>
+              )
+            })}
+            <Stack direction="row" spacing={1} justifyContent="flex-end" data-notification-bulk-actions
+              sx={{ pt: 1.5, borderTop: 1, borderColor: 'divider' }}>
+              <Button size="small" disabled={disabled || !notifications.length}
+                startIcon={busy === 'process:all' ? <CircularProgress size={16} /> : <Send />}
+                onClick={() => void act('process', { all: true })}>
+                全部发送
+              </Button>
+              <Button size="small" color="error" disabled={disabled || !notifications.some(safeToRemove)}
+                startIcon={busy === 'remove:all' ? <CircularProgress size={16} /> : <DeleteOutline />}
+                onClick={() => void act('remove', { all: true })}>
+                全部删除
+              </Button>
+            </Stack>
           </Stack>
         </DialogContent>
         <DialogActions>

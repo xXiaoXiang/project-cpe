@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { createSingleFlight } from '../src/utils/singleFlight.ts'
 import { request } from '../src/api/request.ts'
+import { createModemReadPolicy } from '../src/api/modemPolling.ts'
+import type { ApiResponse } from '../src/api/types.ts'
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -76,4 +78,99 @@ void test('HTTP failures can recover on a later refresh without an overlapping a
   assert.equal(calls, 1)
   assert.deepEqual(await request('/test-recovery'), { value: 'recovered' })
   assert.equal(calls, 2)
+})
+
+void test('modem diagnostics wait for stable registration, pause in airplane mode and resume', async () => {
+  let clock = 1000
+  let online = true
+  let registration = 'searching'
+  const calls: string[] = []
+  const policy = createModemReadPolicy(() => clock)
+  const read = (url: string): Promise<ApiResponse<unknown>> => {
+    calls.push(url)
+    return Promise.resolve({ status: 'ok', message: '', data: url === '/airplane-mode'
+      ? { enabled: !online, online, powered: true }
+      : url === '/network' ? { registration_status: registration } : { value: 'diagnostic' } })
+  }
+  const query = (url: string) => policy.read<ApiResponse<unknown>>(url, read)
+  assert.equal((await query('/cells')).status, 'deferred')
+  for (let tick = 0; tick < 4; tick++) { clock += 1000; await query('/qos') }
+  assert.equal(calls.filter((url) => url === '/network').length, 1)
+  assert.equal(calls.includes('/cells'), false)
+  registration = 'registered'
+  clock += 1000
+  assert.equal((await query('/cells')).status, 'deferred')
+  clock += 3000
+  assert.equal((await query('/cells')).status, 'ok')
+  online = false
+  clock += 5000
+  assert.equal((await query('/qos')).status, 'deferred')
+  assert.equal(calls.includes('/qos'), false)
+  online = true
+  clock += 5000
+  await query('/qos')
+  clock += 3000
+  assert.equal((await query('/qos')).status, 'ok')
+})
+
+void test('InProgress backs off all modem reads for 5/10/20/30 seconds without blocking stats', async () => {
+  let clock = 1000
+  let busy = true
+  const calls: string[] = []
+  const policy = createModemReadPolicy(() => clock)
+  const read = (url: string): Promise<ApiResponse<unknown>> => {
+    calls.push(url)
+    if (url === '/airplane-mode') return Promise.resolve({ status: 'ok', message: '', data: { online: true, powered: true } })
+    if (url === '/network') return Promise.resolve({ status: 'ok', message: '', data: { registration_status: 'registered' } })
+    if (busy && url === '/sim') return Promise.resolve({ status: 'error', message: 'org.ofono.Error.InProgress: Operation already in progress' })
+    return Promise.resolve({ status: 'ok', message: '', data: {} })
+  }
+  const query = (url: string) => policy.read<ApiResponse<unknown>>(url, read)
+  for (const backoff of [5000, 10_000, 20_000, 30_000]) {
+    const response = await query('/sim')
+    assert.equal(response.status, 'deferred')
+    assert.equal(response.retry_after_ms, backoff)
+    const before = calls.length
+    clock += backoff - 1
+    await query('/sim')
+    await query('/qos')
+    assert.equal(calls.length, before)
+    assert.equal((await query('/stats')).status, 'ok')
+    clock++
+    assert.equal((await query('/device/imeisv')).status, 'ok', 'An unrelated success must not reset busy QoS/SIM backoff')
+  }
+  busy = false
+  assert.equal((await query('/sim')).status, 'ok')
+})
+
+void test('SIM changes discard old responses and keep writes out of the background queue', async () => {
+  let clock = 1000
+  const old = deferred<ApiResponse<unknown>>()
+  const policy = createModemReadPolicy(() => clock)
+  const read = async (url: string): Promise<ApiResponse<unknown>> => url === '/airplane-mode'
+    ? { status: 'ok', message: '', data: { online: true, powered: true } }
+    : url === '/network' ? { status: 'ok', message: '', data: { registration_status: 'registered' } }
+      : old.promise
+  const pending = policy.read<ApiResponse<unknown>>('/sim', read)
+  // Let the readiness probe complete and the SIM request enter its pending state.
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  policy.beginTransition()
+  assert.equal((await policy.read<ApiResponse<unknown>>('/sim', read)).status, 'deferred')
+  old.resolve({ status: 'ok', message: '', data: { iccid: 'OLD' } })
+  assert.equal((await pending).status, 'deferred')
+  policy.endTransition()
+  assert.equal((await policy.read<ApiResponse<unknown>>('/sim', read)).status, 'deferred')
+  clock += 3000
+  assert.equal((await policy.read<ApiResponse<unknown>>('/sim', read)).status, 'ok')
+})
+
+void test('interface recovery is deferred, while genuine modem errors remain visible', async () => {
+  let clock = 1000
+  const policy = createModemReadPolicy(() => clock)
+  const read = (url: string): Promise<ApiResponse<unknown>> => Promise.resolve(url === '/airplane-mode'
+    ? { status: 'ok', message: '', data: { online: true, powered: true } }
+    : { status: 'deferred', message: 'NetworkRegistration is restarting', retry_after_ms: 5000 })
+  assert.equal((await policy.read<ApiResponse<unknown>>('/cells', read)).status, 'deferred')
+  clock += 5000
+  await assert.rejects(policy.read('/cells', () => Promise.resolve({ status: 'error', message: 'DBus connection lost' })), /DBus connection lost/)
 })

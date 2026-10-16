@@ -34,6 +34,12 @@ const fixtures: Record<string, unknown> = {
   '/usb-mode': { current_mode: 1, current_mode_name: 'FAST_USB' },
   '/data': { active: true },
   '/airplane-mode': { enabled: false, online: true, powered: true },
+  '/network': { operator_name: 'TEST', registration_status: 'registered', technology_preference: 'NR 5G/LTE auto', signal_strength: 75, mcc: '454', mnc: '03' },
+  '/stats': {},
+  '/qos': { qci: 9, dl_speed: 30000, ul_speed: 10000 },
+  '/ims/status': { registered: true },
+  '/roaming': { is_roaming: false, roaming_allowed: true },
+  '/connectivity': { ipv4: { success: true, latency_ms: 20 }, ipv6: { success: false } },
   '/webhook/config': { enabled: true, url: 'https://slow.example/', headers: {} },
   '/sms/list': [{ id: 1, direction: 'incoming', phone_number: '123', content: 'FAST_SMS', timestamp: '2026-10-14T00:00:00Z', status: 'received' }],
   '/sms/stats': { total: 987, incoming: 987, outgoing: 0 },
@@ -57,6 +63,8 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
   const held = new Set<ServerResponse>()
   let aborted = 0
   let downloadResponse: ServerResponse | undefined
+  let qosError = ''
+  const controlWrites: { path: string; payload: Record<string, boolean>; response: ServerResponse }[] = []
   let notifications: EuiccNotification[] = [
     { seqNumber: 29, iccid: '8965012512294623745', profileManagementOperation: 'future-operation' },
     { seqNumber: 27, iccid: '8985203130001133747', profileManagementOperation: 'enable' },
@@ -80,6 +88,19 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
     if (path.startsWith('/api/')) {
       const endpoint = path.slice(4)
       counts.set(endpoint, (counts.get(endpoint) ?? 0) + 1)
+      if (req.method === 'POST' && ['/data', '/roaming', '/airplane-mode'].includes(endpoint)) {
+        void (async () => {
+          let body = ''
+          for await (const chunk of req) body += String(chunk)
+          controlWrites.push({ path: endpoint, payload: JSON.parse(body) as Record<string, boolean>, response: res })
+        })().catch(() => { res.writeHead(500); res.end() })
+        return
+      }
+      if (endpoint === '/qos' && qosError) {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ status: 'error', message: qosError }))
+        return
+      }
       if (endpoint === '/euicc/notifications') { jsonReply(res, notifications); return }
       if (endpoint.startsWith('/euicc/') && req.method === 'POST') {
         void (async () => {
@@ -211,6 +232,8 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
         await clickTab(scenario.tab)
       }
       await waitFor(textHas(scenario.marker))
+      const startedBy = Date.now() + 6000
+      while (!counts.get(scenario.slow) && Date.now() < startedBy) await delay(100)
       assert.equal(counts.get(scenario.slow), 1)
       if (scenario.manual) {
         // Config forms refresh manually, so click the global refresh button twice.
@@ -233,6 +256,149 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
         : textHas(scenario.slowMarker))
     })
   }
+
+  await t.test('modem startup, busy recovery, airplane display and actual technology', async () => {
+    slowPath = '/cells'
+    counts = new Map()
+    await call('Page.navigate', { url: `${origin}/` })
+    const overview = 'document.querySelector("[data-network-overview]")'
+    await waitFor(`${overview}?.innerText.includes('已注册')`)
+    assert.equal(await evaluate(`${overview}.innerText.includes('5G')`), false, 'Allowed NR mode is not the current network type')
+    assert.equal(await evaluate(`Array.from(${overview}.querySelectorAll('.MuiChip-label')).some(x => x.innerText === 'LTE')`), false)
+    await waitFor(textHas('SLOW_SIM'))
+    const simField = 'Array.from(document.querySelectorAll("main .MuiTypography-root")).find(x => x.innerText === "SLOW_SIM")'
+    await waitFor(`${simField} !== undefined`)
+    assert.equal(await evaluate(`getComputedStyle(${simField}).filter`), 'none')
+    await evaluate(`Array.from(document.querySelectorAll('.MuiCard-root')).find(x => x.innerText.includes('SIM 卡信息')).querySelector('button').click()`)
+    await waitFor(`getComputedStyle(${simField}).filter === 'blur(5px)'`)
+    await evaluate(`document.querySelector('button[title="隐藏所有敏感信息"]').click()`)
+    await evaluate(`document.querySelector('button[title="显示所有敏感信息"]').click()`)
+    await waitFor(`getComputedStyle(${simField}).filter === 'none'`)
+    await waitFor('document.querySelector("main") !== null')
+    const startedBy = Date.now() + 6000
+    while (!held.size && Date.now() < startedBy) await delay(100)
+    const oldCells = fixtures['/cells']
+    fixtures['/cells'] = { serving_cell: { tech: 'lte', cell_id: 123, tac: 456 }, cells: [] }
+    for (const response of held) reply(response, '/cells')
+    held.clear()
+    slowPath = ''
+    await waitFor(`${overview}?.innerText.includes('LTE')`)
+    fixtures['/airplane-mode'] = { enabled: true, powered: true, online: false }
+    // Deliberately leave network/device fixtures registered/online to expose stale data conflicts.
+    await waitFor(`${overview}?.innerText.includes('飞行模式')`)
+    for (const stale of ['已注册', '已上线', '已离线', 'LTE', '75%', 'VoLTE']) {
+      assert.equal(await evaluate(`${overview}.innerText.includes(${JSON.stringify(stale)})`), false)
+    }
+    assert.equal(await evaluate(`${overview}.querySelector('img') !== null`), false)
+
+    fixtures['/airplane-mode'] = { enabled: false, powered: true, online: true }
+    const originalNetwork = fixtures['/network']
+    fixtures['/network'] = { ...(originalNetwork as object), registration_status: 'searching' }
+    counts = new Map()
+    await call('Page.navigate', { url: `${origin}/` })
+    await waitFor(`${overview}?.innerText.includes('正在搜网')`)
+    await delay(2200)
+    assert.equal(counts.get('/cells') ?? 0, 0)
+    assert.equal(counts.get('/qos') ?? 0, 0)
+    const statsBy = Date.now() + 5000
+    while ((counts.get('/stats') ?? 0) < 2 && Date.now() < statsBy) await delay(100)
+    assert.ok((counts.get('/stats') ?? 0) >= 2, `Stats did not refresh: ${JSON.stringify([...counts])}; visibility=${String(await evaluate('document.visibilityState'))}`)
+    assert.equal(await evaluate(textHas('请求失败')), false)
+
+    fixtures['/network'] = originalNetwork
+    qosError = 'Failed to get QoS info: org.ofono.Error.InProgress: Operation already in progress'
+    const attemptedBy = Date.now() + 10_000
+    while (!counts.get('/qos') && Date.now() < attemptedBy) await delay(100)
+    assert.equal(counts.get('/qos'), 1)
+    const statsBefore = counts.get('/stats') ?? 0
+    await delay(2200)
+    assert.equal(counts.get('/qos'), 1, 'Busy QoS must not retry every second')
+    assert.ok((counts.get('/stats') ?? 0) > statsBefore)
+    assert.equal(await evaluate(textHas('请求失败')), false)
+    qosError = ''
+    const recoveredBy = Date.now() + 10_000
+    while ((counts.get('/qos') ?? 0) < 2 && Date.now() < recoveredBy) await delay(100)
+    assert.ok((counts.get('/qos') ?? 0) >= 2, 'QoS resumes automatically')
+    qosError = 'QoS permission denied'
+    await waitFor(textHas('请求失败'))
+    qosError = ''
+    fixtures['/cells'] = oldCells
+  })
+
+  await t.test('quick controls show pending, confirm POST results, reject stale polls and yield modem reads', async () => {
+    slowPath = ''
+    counts = new Map()
+    fixtures['/data'] = { active: true }
+    fixtures['/roaming'] = { roaming_allowed: false, is_roaming: false }
+    await call('Page.navigate', { url: `${origin}/` })
+    const input = (control: string) => `document.querySelector('[data-quick-control="${control}"] input')`
+    const row = (control: string) => `document.querySelector('[data-quick-control="${control}"]')`
+    await waitFor(`${input('roaming')} && !${input('roaming')}.disabled`)
+    const begin = async (control: string, message: string, checked: boolean) => {
+      const before = controlWrites.length
+      await evaluate(`${input(control)}.click()`)
+      await waitFor(`${row(control)}.getAttribute('aria-busy') === 'true' && ${row(control)}.innerText.includes(${JSON.stringify(message)})`)
+      assert.equal(await evaluate(`${input(control)}.checked`), checked, 'Keep the confirmed switch position while pending')
+      assert.equal(await evaluate('Array.from(document.querySelectorAll("[data-quick-control] input")).every(x => x.disabled)'), true)
+      await evaluate(`${input(control)}.click()`)
+      const deadline = Date.now() + 3000
+      while (controlWrites.length === before && Date.now() < deadline) await delay(50)
+      assert.equal(controlWrites.length, before + 1, 'Repeated clicks cannot issue another write')
+      const action = controlWrites.at(-1)
+      assert.ok(action)
+      return action
+    }
+    const complete = async (control: string, data: unknown, checked: boolean) => {
+      const action = controlWrites.at(-1)
+      assert.ok(action)
+      fixtures[action.path] = data
+      jsonReply(action.response, data)
+      await waitFor(`!${input(control)}.disabled && ${input(control)}.checked === ${checked}`)
+      assert.equal(await evaluate(`${row(control)}.getAttribute('aria-busy')`), 'false')
+    }
+
+    const failure = await begin('data', '正在关闭', true)
+    failure.response.writeHead(200, { 'Content-Type': 'application/json' })
+    failure.response.end(JSON.stringify({ status: 'error', message: 'Data connection rejected' }))
+    await waitFor(`!${input('data')}.disabled && ${input('data')}.checked`)
+    await waitFor(textHas('请求失败'))
+    await delay(1200)
+    assert.equal(await evaluate(textHas('请求失败')), true, 'Stats polling must not clear a control failure')
+    await begin('data', '正在关闭', true)
+    await complete('data', { active: false }, false)
+
+    // Hold a read from before the write, then release its old value after success.
+    const oldRoaming = fixtures['/roaming']
+    slowPath = '/roaming'
+    const heldBy = Date.now() + 10_000
+    while (!held.size && Date.now() < heldBy) await delay(100)
+    assert.ok(held.size > 0)
+    const roaming = await begin('roaming', '正在开启', false)
+    assert.deepEqual(roaming.payload, { allowed: true })
+    await delay(1200)
+    await complete('roaming', { roaming_allowed: true, is_roaming: false }, true)
+    slowPath = ''
+    for (const response of held) jsonReply(response, oldRoaming)
+    held.clear()
+    await delay(250)
+    assert.equal(await evaluate(`${input('roaming')}.checked`), true, 'Late old GET must not overwrite POST confirmation')
+
+    for (const enabled of [true, false]) {
+      const action = await begin('airplane', enabled ? '正在开启' : '正在关闭', !enabled)
+      assert.deepEqual(action.payload, { enabled })
+      const diagnosticCounts = ['/qos', '/cells', '/sim'].map((path) => counts.get(path) ?? 0)
+      const statsBefore = counts.get('/stats') ?? 0
+      await delay(2200)
+      assert.deepEqual(['/qos', '/cells', '/sim'].map((path) => counts.get(path) ?? 0), diagnosticCounts)
+      assert.ok((counts.get('/stats') ?? 0) > statsBefore, 'System stats continue during long radio writes')
+      await complete('airplane', { enabled, online: !enabled, powered: true }, enabled)
+    }
+    const transportFailure = await begin('data', '正在开启', false)
+    transportFailure.response.writeHead(503)
+    transportFailure.response.end()
+    await waitFor(`!${input('data')}.disabled && !${input('data')}.checked`)
+    await waitFor(textHas('请求失败'))
+  })
 
   await t.test('eUICC nickname, notification safety and live download progress', async () => {
     slowPath = ''
@@ -267,6 +433,23 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
     await waitFor(textHas('通知 #28'))
     assert.equal(await evaluate('document.querySelectorAll("[data-notification-group]").length'), 2)
     assert.deepEqual(await evaluate(`Array.from(document.querySelector('[data-notification-group="8965012512294623745"]').querySelectorAll('[data-notification]')).map(x => x.getAttribute('data-notification'))`), ['26', '28', '29'])
+    await click('折叠 ICCID 8965012512294623745 的通知')
+    await waitFor(`document.querySelector('[data-notification-group="8965012512294623745"]').querySelectorAll('[data-notification]').length === 0`)
+    assert.equal(await evaluate('document.querySelectorAll("[data-notification]").length'), 1)
+    await click('展开 ICCID 8965012512294623745 的通知')
+    await waitFor('document.querySelectorAll("[data-notification]").length === 4')
+    await waitFor(`getComputedStyle(document.querySelector('[data-notification]').parentElement).gridTemplateColumns.split(' ').length === 2`)
+    await call('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: false })
+    await waitFor(`getComputedStyle(document.querySelector('[data-notification]').parentElement).gridTemplateColumns.split(' ').length === 1`)
+    assert.equal(await evaluate(`Array.from(document.querySelectorAll('[data-notification-group]')).every(x => x.scrollWidth <= x.clientWidth)`), true)
+    await waitFor(`(() => {
+      const bulk = document.querySelector('[data-notification-bulk-actions]');
+      const content = bulk.closest('.MuiDialogContent-root');
+      const cards = Array.from(content.querySelectorAll('[data-notification]'));
+      return cards.every(card => card.getBoundingClientRect().bottom <= bulk.getBoundingClientRect().top)
+        && content.scrollHeight > content.clientHeight;
+    })()`)
+    await call('Emulation.clearDeviceMetricsOverride')
     await click('发送通知 28')
     await waitFor(textHas('通知已发送，记录保留供自行管理。'))
     assert.equal(await evaluate('document.querySelectorAll("[data-notification]").length'), 4)
@@ -278,10 +461,11 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
     await click('删除通知 29')
     await waitFor(textHas('future-operation 操作'))
     await click('取消')
+    await evaluate(`document.querySelector('[data-notification-bulk-actions]').scrollIntoView({ block: 'end' })`)
     await click('全部删除')
     await waitFor(textHas('已删除 2 条通知。'))
     assert.equal(actions.at(-1)?.body.all, true)
-    assert.equal(await evaluate('document.querySelectorAll("[data-notification]").length'), 2)
+    await waitFor('document.querySelectorAll("[data-notification]").length === 2')
     await click('删除通知 28')
     await waitFor(textHas('确认删除通知 #28'))
     await click('确认删除')

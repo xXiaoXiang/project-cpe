@@ -74,7 +74,7 @@ import { useRefreshInterval } from '../contexts/RefreshContext'
 import { useApiRequests } from '../hooks/useApiRequests'
 import { useAdaptivePolling } from '../hooks/useAdaptivePolling'
 import { useSingleFlight } from '../hooks/useSingleFlight'
-import { useRevealAll } from '../contexts/revealSensitive'
+import { useSensitiveVisibility } from '../contexts/revealSensitive'
 import ErrorSnackbar from '../components/ErrorSnackbar'
 import type { CellsResponse, OperatorListResponse, CellLocationResponse, CellLockStatusResponse, NetworkInterfaceInfo, IpAddress, ApnContext } from '../api/types'
 
@@ -107,7 +107,7 @@ function TabPanel(props: TabPanelProps) {
 
 export default function NetworkPage() {
   const { refreshInterval, refreshKey } = useRefreshInterval()
-  const { initialLoading, error, setError, fetchInto } = useApiRequests()
+  const { initialLoading, error, setError, fetchInto, waitingMessage } = useApiRequests()
   const run = useSingleFlight()
   const [success, setSuccess] = useState<string | null>(null)
   const [tabValue, setTabValue] = useState(0)
@@ -126,9 +126,7 @@ export default function NetworkPage() {
   // 网络接口状态
   const [interfaces, setInterfaces] = useState<NetworkInterfaceInfo[]>([])
   const [showDownInterfaces, setShowDownInterfaces] = useState(false)
-  const [localShowIpAddresses, setShowIpAddresses] = useState(false)
-  const revealAll = useRevealAll()
-  const showIpAddresses = localShowIpAddresses || revealAll
+  const [showIpAddresses, setShowIpAddresses] = useSensitiveVisibility()
   
   // 频段锁定状态
   const [currentRadioMode, setCurrentRadioMode] = useState<RadioMode>('auto')
@@ -206,9 +204,9 @@ export default function NetworkPage() {
   // 加载其他数据（自动刷新时调用，不包含频段锁定配置）
   const loadData = useCallback(async () => {
     await Promise.allSettled([
-      fetchInto('cells', '小区信息', () => api.getCellsInfo(), setCellsInfo),
+      fetchInto('cells', '小区信息', () => api.getCellsInfo(), setCellsInfo, () => setCellsInfo(null)),
       fetchInto('operators', '运营商', () => api.getOperators(), setOperators),
-      fetchInto('location', '小区位置', () => api.getCellLocationInfo(), setCellLocation),
+      fetchInto('location', '小区位置', () => api.getCellLocationInfo(), setCellLocation, () => setCellLocation(null)),
       fetchInto('cell-lock', '锁小区状态', () => api.getCellLockStatus(), setCellLockStatus),
       fetchInto('interfaces', '网络接口', () => api.getNetworkInterfaces(), (data) => setInterfaces(data.interfaces)),
       fetchInto('apn', 'APN 配置', () => api.getApnList(), (data) => {
@@ -629,6 +627,7 @@ export default function NetworkPage() {
     <Box>
       {/* 错误/成功提示 */}
       <ErrorSnackbar error={error} onClose={() => setError(null)} />
+      {waitingMessage && <Alert severity="info" sx={{ mb: 2 }}>{waitingMessage}</Alert>}
       <Snackbar open={!!success} autoHideDuration={3000} onClose={() => setSuccess(null)} anchorOrigin={{ vertical: 'top', horizontal: 'center' }}>
         <Alert severity="success" variant="filled" onClose={() => setSuccess(null)}>{success}</Alert>
       </Snackbar>

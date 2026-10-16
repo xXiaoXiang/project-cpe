@@ -17,13 +17,15 @@ use serde::{Deserialize, Serialize};
 /// 统一的 API 响应结构
 #[derive(Debug, Serialize)]
 pub struct ApiResponse<T> {
-    /// 状态：ok 或 error
+    /// 状态：ok、error 或 deferred（Modem 过渡状态，延后读取）
     pub status: String,
     /// 消息说明
     pub message: String,
     /// 响应数据（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
 }
 
 impl<T> ApiResponse<T> {
@@ -33,6 +35,7 @@ impl<T> ApiResponse<T> {
             status: "ok".to_string(),
             message: message.into(),
             data: Some(data),
+            retry_after_ms: None,
         }
     }
 }
@@ -43,10 +46,18 @@ where
 {
     /// Create error response
     pub fn error(message: impl Into<String>) -> Self {
+        let message = message.into();
+        let deferred = message.contains("org.ofono.Error.InProgress")
+            || message.contains("ModemReadDeferred:")
+            || ((message.contains("UnknownMethod") || message.contains("UnknownInterface"))
+                && ["org.ofono.NetworkRegistration", "org.ofono.NetworkMonitor", "org.ofono.SimManager",
+                    "org.ofono.MessageManager", "org.ofono.ConnectionManager", "org.ofono.RadioSettings"]
+                    .iter().any(|interface| message.contains(interface)));
         Self {
-            status: "error".to_string(),
-            message: message.into(),
+            status: if deferred { "deferred" } else { "error" }.to_string(),
+            message,
             data: None,
+            retry_after_ms: deferred.then_some(5000),
         }
     }
 }
@@ -291,6 +302,8 @@ pub struct NetworkInfoResponse {
     pub registration_status: String,
     /// 网络制式偏好
     pub technology_preference: String,
+    /// 当前网络制式（与允许使用的制式偏好不同）
+    pub technology: String,
     /// 信号强度 (0-100)
     pub signal_strength: u8,
     /// MCC (移动国家代码)

@@ -40,19 +40,21 @@ export function StatusOverview({
   roaming,
 }: StatusOverviewProps) {
   const theme = useTheme<Theme>()
+  const mode = airplaneMode ?? deviceInfo
+  const radioOnline = mode?.powered === true && mode.online === true
+  const flightMode = airplaneMode?.enabled === true && airplaneMode.powered
+  const registered = radioOnline && ['registered', 'roaming'].includes(networkInfo?.registration_status ?? '')
 
   const networkTech = (() => {
+    if (!registered) return 'N/A'
+    if (networkInfo?.technology && networkInfo.technology !== 'unknown') return networkInfo.technology.toUpperCase()
     if (cellsInfo?.serving_cell?.tech) {
       return cellsInfo.serving_cell.tech.toUpperCase()
-    }
-    if (networkInfo?.technology_preference) {
-      if (networkInfo.technology_preference.includes('NR')) return '5G'
-      if (networkInfo.technology_preference.includes('LTE')) return 'LTE'
     }
     return 'N/A'
   })()
 
-  const signalStrength = networkInfo?.signal_strength
+  const signalStrength = registered ? networkInfo?.signal_strength : undefined
   const signalColor = signalStrength === undefined ? 'text.disabled' : `${getSignalColor(signalStrength)}.main`
   const registrationLabel = !networkInfo
     ? '加载中'
@@ -60,7 +62,7 @@ export function StatusOverview({
       ? '已注册'
       : networkInfo.registration_status === 'roaming'
         ? '漫游'
-        : networkInfo.registration_status || '未注册'
+        : ({ searching: '正在搜网', initializing: '正在初始化', denied: '注册被拒绝', unregistered: '未注册', unknown: '未知' }[networkInfo.registration_status] || '未注册')
   const registrationColor = !networkInfo
     ? 'default'
     : networkInfo.registration_status === 'registered'
@@ -68,13 +70,15 @@ export function StatusOverview({
       : networkInfo.registration_status === 'roaming'
         ? 'warning'
         : 'default'
-  const modemLabel = !deviceInfo ? '加载中' : deviceInfo.online ? '已上线' : '已离线'
-  const modemColor = !deviceInfo ? 'default' : deviceInfo.online ? 'success' : 'error'
-  const carrierLabel = networkInfo ? formatCarrierName(networkInfo.mcc, networkInfo.mnc) : '载入中'
-  const carrierLogo = networkInfo ? getCarrierLogo(networkInfo.mcc, networkInfo.mnc) : null
+  const modemLabel = !mode ? '加载中' : flightMode ? '飞行模式' : !mode.powered ? 'Modem 未上电' : radioOnline ? '已上线' : '已离线'
+  const modemColor = !mode ? 'default' : flightMode ? 'warning' : radioOnline ? 'success' : 'default'
+  const carrierLabel = registered && networkInfo ? formatCarrierName(networkInfo.mcc, networkInfo.mnc)
+    : !mode ? '载入中' : flightMode ? '射频已关闭' : !radioOnline ? '无网络连接' : registrationLabel
+  const carrierLogo = registered && networkInfo ? getCarrierLogo(networkInfo.mcc, networkInfo.mnc) : null
 
   return (
     <Paper
+      data-network-overview
       elevation={0}
       sx={{
         p: 2,
@@ -98,7 +102,7 @@ export function StatusOverview({
           ) : (
             <Chip
               label={carrierLabel}
-              color={networkInfo ? getCarrierColor(networkInfo.mcc, networkInfo.mnc) : 'default'}
+              color={registered && networkInfo ? getCarrierColor(networkInfo.mcc, networkInfo.mnc) : 'default'}
               size="small"
             />
           )}
@@ -110,17 +114,17 @@ export function StatusOverview({
           </Box>
         </Box>
 
-        <Chip
+        {registered && networkTech !== 'N/A' && <Chip
           icon={<WifiTethering />}
           label={networkTech}
           color={networkTech === '5G' || networkTech === 'NR' ? 'success' : networkTech === 'N/A' ? 'default' : 'primary'}
           size="small"
           sx={{ fontWeight: 'bold' }}
-        />
+        />}
 
-        <Chip icon={<Router />} label={registrationLabel} color={registrationColor} variant="outlined" size="small" />
+        {radioOnline && <Chip icon={<Router />} label={registrationLabel} color={registrationColor} variant="outlined" size="small" />}
 
-        {roaming?.is_roaming && (
+        {registered && roaming?.is_roaming && (
           <Chip
             icon={<TravelExplore />}
             label={roaming.roaming_allowed ? '数据漫游已开启' : '数据漫游已关闭'}
@@ -129,11 +133,9 @@ export function StatusOverview({
           />
         )}
 
-        <Chip icon={<PowerSettingsNew />} label={modemLabel} color={modemColor} size="small" />
+        <Chip icon={flightMode ? <FlightTakeoff /> : <PowerSettingsNew />} label={modemLabel} color={modemColor} size="small" />
 
-        {imsStatus?.registered && <Chip label="VoLTE" color="info" size="small" variant="outlined" />}
-
-        {airplaneMode?.enabled && <Chip icon={<FlightTakeoff />} label="飞行模式" color="warning" size="small" />}
+        {registered && imsStatus?.registered && <Chip label="VoLTE" color="info" size="small" variant="outlined" />}
       </Box>
     </Paper>
   )

@@ -8,7 +8,7 @@
  *
  * Copyright (c) 2025 by 1orz, All Rights Reserved.
  */
-import { Box, LinearProgress } from '@mui/material'
+import { Alert, Box, LinearProgress } from '@mui/material'
 import Grid from '@mui/material/Grid'
 import { useRefreshInterval } from '@/contexts/RefreshContext'
 import ErrorSnackbar from '@/components/ErrorSnackbar'
@@ -27,11 +27,12 @@ import {
 
 export default function Dashboard() {
   const { refreshInterval, refreshKey } = useRefreshInterval()
-  const { initialLoading, error, setError, data, actions } = useDashboardData(refreshInterval, refreshKey)
+  const { initialLoading, error, setError, waitingMessage, pendingControl, data, actions } = useDashboardData(refreshInterval, refreshKey)
 
   return (
     <Box>
       <ErrorSnackbar error={error} onClose={() => setError(null)} />
+      {waitingMessage && !data.airplaneMode?.enabled && <Alert severity="info" sx={{ mb: 2 }}>{waitingMessage}</Alert>}
 
       {initialLoading && (
         <Box sx={{ mb: 2 }}>
@@ -57,6 +58,7 @@ export default function Dashboard() {
             dataStatus={data.dataStatus}
             airplaneMode={data.airplaneMode}
             roaming={data.roaming}
+            pendingControl={pendingControl}
             onToggleData={() => void actions.toggleData()}
             onToggleAirplaneMode={() => void actions.toggleAirplaneMode()}
             onToggleRoaming={() => void actions.toggleRoaming()}

@@ -8,8 +8,14 @@ export function useApiRequests() {
   const active = useRef(true)
   const errors = useRef(new Map<string, string>())
   const [initialLoading, setInitialLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const [requestError, setRequestError] = useState<string | null>(null)
+  const [manualError, setManualError] = useState<string | null>(null)
+  const setError = useCallback((message: string | null) => {
+    setManualError(message)
+    if (message === null) setRequestError(null)
+  }, [])
   const [ready, setReady] = useState<Record<string, boolean>>({})
+  const [waiting, setWaiting] = useState<Record<string, string>>({})
 
   useEffect(() => {
     active.current = true
@@ -21,14 +27,29 @@ export function useApiRequests() {
     label: string,
     request: () => Promise<ApiResponse<T>>,
     apply: (data: T) => void,
+    onDeferred?: () => void,
   ) => run(key, async () => {
     try {
       const response = await request()
+      if (response.status === 'deferred') {
+        errors.current.delete(key)
+        if (active.current) {
+          onDeferred?.()
+          setWaiting((current) => current[key] === response.message ? current : { ...current, [key]: response.message })
+        }
+        return
+      }
       if (response.status !== 'ok' || response.data === undefined || response.data === null) {
         throw new Error(response.message || '未返回有效数据')
       }
       if (!active.current) return
       apply(response.data)
+      setWaiting((current) => {
+        if (!(key in current)) return current
+        const next = { ...current }
+        delete next[key]
+        return next
+      })
       setReady((current) => current[key] ? current : { ...current, [key]: true })
       errors.current.delete(key)
     } catch (reason) {
@@ -37,10 +58,11 @@ export function useApiRequests() {
     } finally {
       if (active.current) {
         setInitialLoading(false)
-        setError(errors.current.values().next().value ?? null)
+        // A successful stats tick must not erase an interactive write failure.
+        setRequestError(errors.current.values().next().value ?? null)
       }
     }
   }), [run])
 
-  return { fetchInto, initialLoading, error, setError, ready }
+  return { fetchInto, initialLoading, error: manualError ?? requestError, setError, ready, waitingMessage: Object.values(waiting)[0] ?? null }
 }

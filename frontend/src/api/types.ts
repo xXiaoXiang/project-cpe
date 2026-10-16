@@ -12,6 +12,7 @@
 export interface ApiResponse<T> {
   status: string
   message: string
+  retry_after_ms?: number
   data?: T
 }
 
@@ -98,6 +99,7 @@ export interface NetworkInfo {
   operator_name: string
   registration_status: string
   technology_preference: string
+  technology?: string // 当前制式，不能用允许的制式偏好代替
   signal_strength: number
   mcc?: string // 移动国家代码
   mnc?: string // 移动网络代码
