@@ -101,3 +101,41 @@ export function useAdaptivePolling({
     isPageVisible,
   }
 }
+
+// Slow, cached resources use their own cadence, measured after completion.
+// A deferred response may request an earlier retry without following the
+// dashboard's 1/2/3/5/10-second refresh interval.
+export function useCompletionPolling({
+  interval,
+  enabled,
+  refreshKey,
+  onTick,
+}: {
+  interval: number
+  enabled: boolean
+  refreshKey: number
+  onTick: () => Promise<number | undefined>
+}) {
+  const tickRef = useRef(onTick)
+  useEffect(() => { tickRef.current = onTick }, [onTick])
+  const visible = usePageVisibility()
+  useEffect(() => {
+    let stopped = false
+    let timer: number | undefined
+    const tick = async () => {
+      let retry: number | undefined
+      try {
+        retry = await tickRef.current()
+      } catch {
+        retry = interval
+      } finally {
+        if (!stopped && enabled) {
+          timer = window.setTimeout(() => { void tick() },
+            getAdaptiveRefreshInterval(retry ?? interval, visible))
+        }
+      }
+    }
+    void tick()
+    return () => { stopped = true; window.clearTimeout(timer) }
+  }, [enabled, interval, refreshKey, visible])
+}

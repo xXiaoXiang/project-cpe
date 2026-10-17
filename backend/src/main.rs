@@ -159,6 +159,9 @@ async fn main() -> Result<()> {
 
     // Connect to system D-Bus
     let dbus_conn = Arc::new(Connection::system().await?);
+    if let Err(error) = dbus::start_snapshot_invalidation(&dbus_conn).await {
+        warn!(%error, "oFono snapshot signal subscription failed; using bounded TTLs");
+    }
     
     // 创建 SMS 数据库（存储在可执行文件同级目录）
     let db_path = get_persistent_root_dir().join("data.db");

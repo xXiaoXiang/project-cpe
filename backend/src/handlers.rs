@@ -23,7 +23,7 @@ use futures_util::stream;
 use serde_json::{json, Value};
 use std::{convert::Infallible, process::Stdio, sync::Arc};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader},
     process::Command as TokioCommand,
     sync::mpsc,
 };
@@ -51,6 +51,39 @@ use crate::{
 };
 use crate::state::FrontendRuntime;
 use std::process::Command;
+use crate::serial::ReadSnapshot;
+
+static BAND_LOCK_SNAPSHOT: ReadSnapshot<BandLockStatus> = ReadSnapshot::new();
+static CELL_LOCK_SNAPSHOT: ReadSnapshot<CellLockStatusResponse> = ReadSnapshot::new();
+static STATS_SNAPSHOT: ReadSnapshot<SystemStatsResponse> = ReadSnapshot::new();
+static SYSTEM_INFO_SNAPSHOT: ReadSnapshot<SystemInfo> = ReadSnapshot::new();
+static EUICC_SNAPSHOT: ReadSnapshot<EuiccInfoResponse> = ReadSnapshot::new();
+static EUICC_PROBE_SNAPSHOT: ReadSnapshot<Result<Value, String>> = ReadSnapshot::new();
+static NOTIFICATION_SNAPSHOT: ReadSnapshot<Vec<EuiccNotification>> = ReadSnapshot::new();
+
+struct EuiccCacheChange;
+
+impl EuiccCacheChange {
+    fn new() -> Self {
+        Self::invalidate();
+        Self
+    }
+
+    fn invalidate() {
+        EUICC_SNAPSHOT.invalidate();
+        EUICC_PROBE_SNAPSHOT.invalidate();
+        NOTIFICATION_SNAPSHOT.invalidate();
+    }
+}
+
+impl Drop for EuiccCacheChange {
+    fn drop(&mut self) { Self::invalidate(); }
+}
+
+async fn with_euicc_write<T>(work: impl std::future::Future<Output = T>) -> T {
+    let _change = EuiccCacheChange::new();
+    crate::serial::with_euicc_serial(work).await
+}
 
 fn lpac_command(args: &[String]) -> TokioCommand {
     let path = std::env::var_os("LPAC_PATH")
@@ -104,30 +137,161 @@ fn lpac_failure(payload: &LpacPayload) -> String {
         if detail.is_empty() { "" } else { ": " }, detail)
 }
 
-async fn run_lpac_json(args: &[String]) -> Result<Value, String> {
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(120),
-        lpac_command(args).output(),
-    )
-    .await
-    .map_err(|_| "lpac command timed out after 120 seconds".to_string())?
-    .map_err(|error| format!("Failed to start lpac: {error}"))?;
+// A broken APDU driver must not exhaust the web server's memory by repeatedly
+// printing errors. Allow profile icons, but bound both pipes independently.
+const LPAC_STDOUT_LIMIT: usize = 4 * 1024 * 1024;
+const LPAC_STDERR_LIMIT: usize = 64 * 1024;
+
+async fn read_lpac_output<R: AsyncRead + Unpin>(reader: R, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    reader.take(limit as u64 + 1).read_to_end(&mut output).await?;
+    if output.len() > limit {
+        return Err(std::io::Error::other(format!("LPAC output exceeded {limit} bytes")));
+    }
+    Ok(output)
+}
+
+async fn capture_lpac_output(
+    mut command: TokioCommand,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    let mut child = command.kill_on_drop(true)
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
+        .map_err(|error| format!("Failed to start lpac: {error}"))?;
+    let captured = tokio::time::timeout(timeout, async {
+        let stdout = child.stdout.take().ok_or_else(|| std::io::Error::other("Missing LPAC stdout"))?;
+        let stderr = child.stderr.take().ok_or_else(|| std::io::Error::other("Missing LPAC stderr"))?;
+        // Read both pipes while waiting; return immediately on oversized output.
+        let (status, stdout, stderr) = tokio::try_join!(
+            child.wait(),
+            read_lpac_output(stdout, LPAC_STDOUT_LIMIT),
+            read_lpac_output(stderr, LPAC_STDERR_LIMIT),
+        )?;
+        Ok::<_, std::io::Error>(std::process::Output { status, stdout, stderr })
+    }).await;
+    let error = match captured {
+        Ok(Ok(output)) => return Ok(output),
+        Err(_) => format!("LPAC timed out after {} seconds", timeout.as_secs()),
+        Ok(Err(error)) => format!("Failed to read LPAC output: {error}"),
+    };
+    // Tokio sends SIGKILL on Unix (not SIGINT/SIGTERM), then waits to reap the
+    // process. This also handles LPAC ignoring Ctrl+C while reading the AT port.
+    if let Err(cleanup_error) = child.kill().await {
+        return Err(format!("{error}; failed to terminate/reap LPAC: {cleanup_error}"));
+    }
+    Err(error)
+}
+
+fn lpac_diagnostic(bytes: &[u8]) -> String {
+    // Bound HTTP error messages too, and preserve UTF-8 character boundaries.
+    let text = String::from_utf8_lossy(bytes);
+    let mut tail: Vec<char> = text.chars().rev().take(1024).collect();
+    tail.reverse();
+    tail.into_iter().collect()
+}
+
+fn decode_lpac_output(output: std::process::Output) -> Result<Value, String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let response = parse_lpac_events(&stdout)
         .into_iter()
         .filter(|event| event.event_type == "lpa")
         .last()
         .ok_or_else(|| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            format!("lpac returned no final lpa result: {}{}", stdout, stderr)
+            format!("LPAC exited with {} without a final lpa result: {} {}",
+                output.status, lpac_diagnostic(&output.stdout), lpac_diagnostic(&output.stderr))
         })?;
 
     if !output.status.success() || response.payload.code != 0 {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("{} {}", lpac_failure(&response.payload), stderr));
+        return Err(format!("{} ({}). {}", lpac_failure(&response.payload),
+            output.status, lpac_diagnostic(&output.stderr)));
     }
 
     Ok(response.payload.data)
+}
+
+async fn run_lpac_json_timeout(args: &[String], seconds: u64) -> Result<Value, String> {
+    let result = match capture_lpac_output(lpac_command(args), std::time::Duration::from_secs(seconds)).await {
+        Ok(output) => decode_lpac_output(output),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = &result {
+        // Do not log activation codes, nicknames, or the full Profile list.
+        tracing::warn!(command = ?args.iter().take(2).collect::<Vec<_>>(), error = %error, "LPAC request failed");
+    }
+    result
+}
+
+async fn run_lpac_json(args: &[String]) -> Result<Value, String> {
+    run_lpac_json_timeout(args, 120).await
+}
+
+#[cfg(test)]
+mod lpac_process_tests {
+    use super::*;
+
+    fn fixture(mode: &str) -> TokioCommand {
+        let mut command = TokioCommand::new(std::env::current_exe().unwrap());
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        command.args(["--ignored", "--exact", &format!("{module}::child"), "--nocapture"])
+            .env("LPAC_TEST_CHILD_MODE", mode);
+        command
+    }
+
+    // A separate process exercises the actual pipe/exit/kill handling on both
+    // Windows test hosts and Linux. It never accesses a modem or SIM.
+    #[test]
+    #[ignore]
+    fn child() {
+        match std::env::var("LPAC_TEST_CHILD_MODE").unwrap().as_str() {
+            "hung" => std::thread::sleep(std::time::Duration::from_secs(60)),
+            "overflow" => {
+                use std::io::Write;
+                let _ = std::io::stderr().write_all(&vec![b'x'; LPAC_STDERR_LIMIT + 1]);
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+            "failed" => std::process::exit(7),
+            "malformed" => println!("ordinary SIM: ISD-R application not found"),
+            "lpa_failure" => println!(r#"{{"type":"lpa","payload":{{"code":-1,"message":"euicc_init","data":null}}}}"#),
+            mode => {
+                println!(r#"{{"type":"lpa","payload":{{"code":0,"message":"success","data":{{"eidValue":"test-eid"}}}}}}"#);
+                if mode == "false_success" { std::process::exit(1); }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn process_failures_do_not_prevent_the_next_request() {
+        for mode in ["failed", "malformed", "lpa_failure", "false_success"] {
+            let output = capture_lpac_output(fixture(mode), std::time::Duration::from_secs(5)).await.unwrap();
+            let error = decode_lpac_output(output).unwrap_err();
+            assert!(!error.is_empty(), "{mode}");
+            if mode == "failed" { assert!(error.contains('7'), "{error}"); }
+        }
+        let output = capture_lpac_output(fixture("success"), std::time::Duration::from_secs(5)).await.unwrap();
+        assert_eq!(decode_lpac_output(output).unwrap()["eidValue"], "test-eid");
+    }
+
+    #[tokio::test]
+    async fn timeout_and_excessive_output_terminate_the_child_promptly() {
+        let started = std::time::Instant::now();
+        let error = capture_lpac_output(fixture("hung"), std::time::Duration::from_millis(500)).await.unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let output = capture_lpac_output(fixture("success"), std::time::Duration::from_secs(5)).await.unwrap();
+        assert_eq!(decode_lpac_output(output).unwrap()["eidValue"], "test-eid");
+        let error = capture_lpac_output(fixture("overflow"), std::time::Duration::from_secs(5)).await.unwrap_err();
+        assert!(error.contains("exceeded"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn output_limit_handles_exact_boundary_and_unterminated_lines() {
+        assert_eq!(read_lpac_output(&b"1234"[..], 4).await.unwrap(), b"1234");
+        assert!(read_lpac_output(&b"12345"[..], 4).await.is_err());
+        let text = "测试".repeat(2000);
+        let tail = lpac_diagnostic(text.as_bytes());
+        assert_eq!(tail.chars().count(), 1024);
+    }
 }
 
 fn euicc_error(status: StatusCode, message: impl Into<String>) -> Response {
@@ -154,41 +318,48 @@ fn validate_euicc_identifier(iccid: &str) -> Result<(), String> {
 
 /// GET /api/euicc - 检查 eUICC 并列出已安装 Profile
 pub async fn get_euicc_info(State(_conn): State<Arc<Connection>>) -> Response {
-    let result = crate::serial::with_euicc_serial(async {
-        let chip_args = vec!["chip".to_string(), "info".to_string()];
-        let chip_info = run_lpac_json(&chip_args).await?;
-        let eid = chip_info
-            .get("eidValue")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| "lpac chip info did not return an EID".to_string())?
-            .to_string();
-        let firmware_version = chip_info
-            .get("EUICCInfo2")
-            .and_then(|value| value.get("euiccFirmwareVer"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
+    let result = EUICC_SNAPSHOT.get("lpac", std::time::Duration::from_secs(10), async {
+        crate::serial::with_euicc_serial(async {
+            let chip_args = vec!["chip".to_string(), "info".to_string()];
+            // A regular SIM can hang chip info until its hard timeout. Briefly
+            // reuse a failed probe as well, instead of spawning it for every client.
+            let probe = EUICC_PROBE_SNAPSHOT.get("lpac", std::time::Duration::from_secs(10), async {
+                Ok(run_lpac_json_timeout(&chip_args, 10).await)
+            }).await.map_err(|error| error.to_string())?;
+            let chip_info = probe.as_ref().as_ref()
+                .map_err(|error| format!("无法读取 eUICC：请确认插入的是 eUICC 卡，并等待 SIM 初始化完成。{error}"))?;
+            let eid = chip_info
+                .get("eidValue")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "lpac chip info did not return an EID".to_string())?
+                .to_string();
+            let firmware_version = chip_info
+                .get("EUICCInfo2")
+                .and_then(|value| value.get("euiccFirmwareVer"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
 
-        let profile_args = vec!["profile".to_string(), "list".to_string()];
-        let profile_data = run_lpac_json(&profile_args).await?;
-        let profiles = serde_json::from_value(profile_data)
-            .map_err(|error| format!("Invalid lpac profile list: {error}"))?;
+            let profile_args = vec!["profile".to_string(), "list".to_string()];
+            let profile_data = run_lpac_json_timeout(&profile_args, 20).await?;
+            let profiles = serde_json::from_value(profile_data)
+                .map_err(|error| format!("Invalid lpac profile list: {error}"))?;
 
-        Ok::<_, String>(EuiccInfoResponse {
-            eid,
-            firmware_version,
-            profiles,
-        })
-    })
-    .await;
+            Ok::<_, String>(EuiccInfoResponse {
+                eid,
+                firmware_version,
+                profiles,
+            })
+        }).await.map_err(zbus::Error::Failure)
+    }).await;
 
     match result {
         Ok(data) => (
             StatusCode::OK,
-            Json(ApiResponse::success_with_message("eUICC ready", data)),
+            Json(ApiResponse::success_with_message("eUICC ready", data.as_ref().clone())),
         )
             .into_response(),
-        Err(error) => euicc_failure(error),
+        Err(error) => euicc_failure(error.to_string()),
     }
 }
 
@@ -209,7 +380,7 @@ pub async fn enable_euicc_profile(
         request.iccid.clone(),
         "1".to_string(),
     ];
-    let result: Result<(Vec<EuiccProfile>, Option<String>), String> = crate::serial::with_euicc_serial(async {
+    let result: Result<Vec<EuiccProfile>, String> = with_euicc_write(async {
         run_lpac_json(&args).await?;
 
         let list_args = vec!["profile".to_string(), "list".to_string()];
@@ -225,14 +396,7 @@ pub async fn enable_euicc_profile(
                                 && profile.profile_state.eq_ignore_ascii_case("enabled")
                         }) =>
                     {
-                        // Keep the eUICC change serialized through selection recovery.
-                        // A failed recovery must not hide an already successful switch.
-                        let selection_warning = crate::dbus::register_operator_auto(&conn)
-                            .await.err().map(|error| error.to_string());
-                        if let Some(warning) = &selection_warning {
-                            tracing::warn!("Profile enabled but automatic selection was not confirmed: {}", warning);
-                        }
-                        return Ok((profiles, selection_warning));
+                        return Ok(profiles);
                     }
                     Ok(_) => last_error = "Profile list does not show the target as enabled".to_string(),
                     Err(error) => last_error = format!("Invalid lpac profile list: {error}"),
@@ -245,15 +409,19 @@ pub async fn enable_euicc_profile(
     .await;
 
     match result {
-        Ok((profiles, selection_warning)) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message(
-                "Profile enabled",
-                json!({ "iccid": request.iccid, "profiles": profiles,
-                    "network_selection_warning": selection_warning }),
-            )),
-        )
-            .into_response(),
+        Ok(profiles) => {
+            let (selection_pending, selection_warning) = crate::dbus::submit_profile_auto_selection(conn).await;
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "Profile enabled; automatic selection submitted; registration may take 1-2 minutes",
+                    json!({ "iccid": request.iccid, "profiles": profiles,
+                        "network_selection_submitted": true,
+                        "network_selection_pending": selection_pending,
+                        "network_selection_warning": selection_warning }),
+                )),
+            ).into_response()
+        },
         Err(error) => euicc_failure(error),
     }
 }
@@ -290,7 +458,7 @@ pub async fn delete_euicc_profile(
         "delete".to_string(),
         request.iccid.clone(),
     ];
-    let result = crate::serial::with_euicc_serial(async { run_lpac_json(&args).await }).await;
+    let result = with_euicc_write(async { run_lpac_json(&args).await }).await;
     match result {
         Ok(_) => (
             StatusCode::OK,
@@ -314,7 +482,7 @@ pub async fn nickname_euicc_profile(
         return euicc_failure("昵称最多 32 个字符，且不能包含控制字符");
     }
     let args = vec!["profile".into(), "nickname".into(), request.iccid.clone(), request.nickname.clone()];
-    match crate::serial::with_euicc_serial(async { run_lpac_json(&args).await }).await {
+    match with_euicc_write(async { run_lpac_json(&args).await }).await {
         Ok(_) => Json(ApiResponse::success_with_message("昵称已保存", json!({
             "iccid": request.iccid, "nickname": request.nickname,
         }))).into_response(),
@@ -328,9 +496,11 @@ async fn read_euicc_notifications() -> Result<Vec<EuiccNotification>, String> {
 }
 
 pub async fn list_euicc_notifications() -> Response {
-    match crate::serial::with_euicc_serial(read_euicc_notifications()).await {
-        Ok(notifications) => Json(ApiResponse::success_with_message("通知已读取", notifications)).into_response(),
-        Err(error) => euicc_failure(error),
+    match NOTIFICATION_SNAPSHOT.get("lpac", std::time::Duration::from_secs(10), async {
+        crate::serial::with_euicc_serial(read_euicc_notifications()).await.map_err(zbus::Error::Failure)
+    }).await {
+        Ok(notifications) => Json(ApiResponse::success_with_message("通知已读取", notifications.as_ref().clone())).into_response(),
+        Err(error) => euicc_failure(error.to_string()),
     }
 }
 
@@ -350,7 +520,7 @@ pub async fn process_euicc_notifications(
         Err(error) => return euicc_failure(error),
     };
     let args = vec!["notification".into(), "process".into(), target];
-    match crate::serial::with_euicc_serial(async { run_lpac_json(&args).await }).await {
+    match with_euicc_write(async { run_lpac_json(&args).await }).await {
         Ok(_) => Json(ApiResponse::success_with_message("通知已发送，记录保留供自行管理", json!({}))).into_response(),
         Err(error) => euicc_failure(error),
     }
@@ -366,7 +536,7 @@ pub async fn remove_euicc_notifications(
     if let Err(error) = notification_target(&request) {
         return euicc_failure(error);
     }
-    let result = crate::serial::with_euicc_serial(async {
+    let result = with_euicc_write(async {
         // Read and remove under the same serial lock. Never use remove -a:
         // it would also delete operator notifications that must be preserved.
         let notifications = read_euicc_notifications().await?;
@@ -479,7 +649,7 @@ pub async fn download_euicc_profile(
 
     let (sender, receiver) = mpsc::channel::<Bytes>(32);
     tokio::spawn(async move {
-        crate::serial::with_euicc_serial(async move {
+        with_euicc_write(async move {
             let spawn_result = lpac_command(&args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -641,43 +811,39 @@ async fn fetch_neighbor_cells(
 ///   }
 /// }
 /// ```
+async fn read_cells_snapshot(conn: &Connection) -> zbus::Result<Arc<CellsResponse>> {
+    crate::dbus::CELL_SNAPSHOT.get(
+        &crate::dbus::snapshot_scope(conn), std::time::Duration::from_secs(3), async {
+            let result = async {
+                let serving_cell = get_serving_cell_info(conn)
+                    .await
+                    .map_err(|e| format!("Failed to get serving cell info: {}", e))?;
+                let tech = serving_cell.tech.as_str();
+                let cmd_config = get_cell_command_config(tech)
+                    .ok_or_else(|| format!("Unsupported network type: {}", tech))?;
+
+                // AT calls remain serial. Cache the complete result so readers
+                // cannot mix independently cached primary/neighbor samples.
+                let primary_cell = fetch_primary_cell(conn, cmd_config.primary, tech).await?;
+                let neighbor_cells = fetch_neighbor_cells(conn, cmd_config.neighbor, tech).await?;
+                let mut all_cells = vec![primary_cell];
+                all_cells.extend(neighbor_cells);
+                Ok::<_, String>(CellsResponse { serving_cell, cells: all_cells })
+            }.await;
+            result.map_err(zbus::Error::Failure)
+    }).await
+}
+
 pub async fn get_cells(State(conn): State<Arc<Connection>>) -> impl IntoResponse {
-    let result = async {
-        // 1. 获取服务小区信息（包含网络制式）
-        let serving_cell = get_serving_cell_info(&conn)
-            .await
-            .map_err(|e| format!("Failed to get serving cell info: {}", e))?;
-
-        let tech = serving_cell.tech.as_str();
-
-        // 2. 根据网络制式获取对应的 AT 指令配置
-        let cmd_config = get_cell_command_config(tech)
-            .ok_or_else(|| format!("Unsupported network type: {}", tech))?;
-
-        // 3. 顺序获取主小区和邻区信息
-        // 注意：ofono D-Bus 不支持并发 AT 指令，必须串行执行
-        let primary_cell = fetch_primary_cell(&conn, cmd_config.primary, tech).await?;
-        let neighbor_cells = fetch_neighbor_cells(&conn, cmd_config.neighbor, tech).await?;
-
-        // 4. 合并主小区和邻区
-        let mut all_cells = vec![primary_cell];
-        all_cells.extend(neighbor_cells);
-
-        Ok::<_, String>(CellsResponse {
-            serving_cell,
-            cells: all_cells,
-        })
-    }
-    .await;
-
+    let result = read_cells_snapshot(&conn).await;
     match result {
         Ok(data) => (
             StatusCode::OK,
-            Json(ApiResponse::success_with_message("Success", data)),
+            Json(ApiResponse::success_with_message("Success", data.as_ref().clone())),
         ),
         Err(msg) => (
             StatusCode::OK,
-            Json(ApiResponse::<CellsResponse>::error(msg)),
+            Json(ApiResponse::<CellsResponse>::error(msg.to_string())),
         ),
     }
 }
@@ -921,28 +1087,13 @@ pub async fn set_airplane_mode_handler(
 ) -> impl IntoResponse {
     let _modem_change = crate::serial::modem_change();
     match set_airplane_mode(&conn, payload.enabled).await {
-        Ok(_) => {
-            // 读取当前状态确认
-            match get_airplane_mode(&conn).await {
-                Ok(status) => {
-                    let msg = if payload.enabled {
-                        "Airplane mode enabled successfully"
-                    } else {
-                        "Airplane mode disabled successfully"
-                    };
-                    (
-                        StatusCode::OK,
-                        Json(ApiResponse::success_with_message(msg, status)),
-                    )
-                }
-                Err(e) => (
-                    StatusCode::OK,
-                    Json(ApiResponse::<AirplaneModeResponse>::error(format!(
-                        "Airplane mode set but failed to read status: {}",
-                        e
-                    ))),
-                ),
-            }
+        Ok(status) => {
+            let msg = if payload.enabled {
+                "Airplane mode enabled successfully"
+            } else {
+                "Airplane mode disabled successfully"
+            };
+            (StatusCode::OK, Json(ApiResponse::success_with_message(msg, status)))
         }
         Err(e) => (
             StatusCode::OK,
@@ -1351,11 +1502,11 @@ pub async fn get_cpu_info() -> impl IntoResponse {
 ///   }
 /// }
 /// ```
-pub async fn get_system_stats() -> impl IntoResponse {
+async fn sample_system_stats() -> Result<SystemStatsResponse, String> {
     use std::time::{Duration, Instant};
     use tokio::time::sleep;
     
-    let result: Result<SystemStatsResponse, String> = async {
+    async {
         // 获取网速和 CPU 使用率（并行异步采样）
         let interfaces = get_active_interfaces()?;
         let mut first_samples = Vec::new();
@@ -1417,7 +1568,9 @@ pub async fn get_system_stats() -> impl IntoResponse {
         let formatted = format_uptime(uptime);
         
         // 获取系统信息（uname）
-        let system_info = read_system_info()?;
+        let system_info = SYSTEM_INFO_SNAPSHOT.get_local(Duration::from_secs(300), async {
+            read_system_info().map_err(zbus::Error::Failure)
+        }).await.map_err(|error| error.to_string())?.as_ref().clone();
         
         // 获取温度
         let temperature = read_temperature_sensors();
@@ -1460,16 +1613,22 @@ pub async fn get_system_stats() -> impl IntoResponse {
             usb_mode,
         })
     }
-    .await;
+    .await
+}
+
+pub async fn get_system_stats() -> impl IntoResponse {
+    let result = STATS_SNAPSHOT.get_local(std::time::Duration::from_secs(1), async {
+        sample_system_stats().await.map_err(zbus::Error::Failure)
+    }).await;
     
     match result {
         Ok(data) => (
             StatusCode::OK,
-            Json(ApiResponse::success_with_message("Success", data)),
+            Json(ApiResponse::success_with_message("Success", data.as_ref().clone())),
         ),
         Err(msg) => (
             StatusCode::OK,
-            Json(ApiResponse::<SystemStatsResponse>::error(msg)),
+            Json(ApiResponse::<SystemStatsResponse>::error(msg.to_string())),
         ),
     }
 }
@@ -1477,76 +1636,34 @@ pub async fn get_system_stats() -> impl IntoResponse {
 /// GET /api/location/cell-info - 获取基站定位参数
 /// 
 /// 返回格式化的基站定位参数，可用于调用第三方定位API（如Google Geolocation、OpenCellID等）
-pub async fn get_cell_location_info(State(conn): State<Arc<Connection>>) -> impl IntoResponse {
+async fn read_cell_location_info(conn: &Connection) -> zbus::Result<CellLocationResponse> {
     // 获取网络信息（MCC、MNC）
-    let network_info = match get_network_info_data(&conn).await {
-        Ok(info) => info,
-        Err(e) => {
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::<CellLocationResponse>::error(format!(
-                    "Failed to get network info: {}",
-                    e
-                ))),
-            );
-        }
-    };
+    let network_info = get_network_info_data(conn).await?;
 
     // 检查是否有 MCC 和 MNC
     let mcc = match network_info.mcc {
         Some(ref m) if !m.is_empty() => m.clone(),
         _ => {
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::success_with_message(
-                    "Cell location unavailable: MCC not available",
-                    CellLocationResponse {
-                        available: false,
-                        cell_info: None,
-                        neighbor_cells: vec![],
-                        usage_hint: "Network not registered or MCC/MNC not available. Please ensure device is connected to cellular network.".to_string(),
-                    },
-                )),
-            );
+            return Err(zbus::Error::Failure("ModemReadDeferred: waiting for registered MCC".into()));
         }
     };
 
     let mnc = match network_info.mnc {
         Some(ref m) if !m.is_empty() => m.clone(),
         _ => {
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::success_with_message(
-                    "Cell location unavailable: MNC not available",
-                    CellLocationResponse {
-                        available: false,
-                        cell_info: None,
-                        neighbor_cells: vec![],
-                        usage_hint: "Network not registered or MCC/MNC not available. Please ensure device is connected to cellular network.".to_string(),
-                    },
-                )),
-            );
+            return Err(zbus::Error::Failure("ModemReadDeferred: waiting for registered MNC".into()));
         }
     };
 
     // 获取服务小区信息（TAC、CID）
-    let serving_cell = match get_serving_cell_info(&conn).await {
-        Ok(cell) => cell,
-        Err(e) => {
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::<CellLocationResponse>::error(format!(
-                    "Failed to get serving cell info: {}",
-                    e
-                ))),
-            );
-        }
-    };
+    let mut serving_cell = get_serving_cell_info(conn).await?;
+    if serving_cell.cell_id == 0 {
+        return Err(zbus::Error::Failure("ModemReadDeferred: waiting for serving cell identity".into()));
+    }
 
     // 获取详细的小区信息（信号强度等）
-    let tech = serving_cell.tech.as_str();
-    let cmd_config = match get_cell_command_config(tech) {
-        Some(config) => config,
+    match get_cell_command_config(&serving_cell.tech) {
+        Some(_) => {},
         None => {
             // 如果不支持当前网络制式，返回基本信息（不含信号强度）
             let cell_info = if serving_cell.cell_id > 0 {
@@ -1569,7 +1686,7 @@ pub async fn get_cell_location_info(State(conn): State<Arc<Connection>>) -> impl
             let usage_hint = format!(
                 "Cell location data available (limited). Unsupported network type: {}.\n\
                 Network: {} (MCC={}, MNC={}), Cell ID={}, TAC={}",
-                tech,
+                serving_cell.tech,
                 network_info.operator_name,
                 mcc,
                 mnc,
@@ -1577,24 +1694,19 @@ pub async fn get_cell_location_info(State(conn): State<Arc<Connection>>) -> impl
                 serving_cell.tac
             );
 
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::success_with_message(
-                    "Success (limited info)",
-                    CellLocationResponse {
-                        available: cell_info.is_some(),
-                        cell_info,
-                        neighbor_cells: vec![],
-                        usage_hint,
-                    },
-                )),
-            );
+            return Ok(CellLocationResponse {
+                available: cell_info.is_some(), cell_info, neighbor_cells: vec![], usage_hint,
+            });
         }
     };
 
     // 获取主小区和邻区详细信息
-    let serving_cell_detail = fetch_primary_cell(&conn, cmd_config.primary, tech).await.ok();
-    let neighbor_cells = fetch_neighbor_cells(&conn, cmd_config.neighbor, tech).await.unwrap_or_default();
+    // Share the complete primary/neighbor sample with /api/cells. Never turn a
+    // transient read failure into a successful empty/default location result.
+    let snapshot = read_cells_snapshot(conn).await?;
+    serving_cell = snapshot.serving_cell.clone();
+    let serving_cell_detail = snapshot.cells.iter().find(|cell| cell.is_serving);
+    let neighbor_cells: Vec<_> = snapshot.cells.iter().filter(|cell| !cell.is_serving).collect();
 
     // 构建主服务小区定位信息
     let cell_info = if serving_cell.cell_id > 0 {
@@ -1674,10 +1786,22 @@ pub async fn get_cell_location_info(State(conn): State<Arc<Connection>>) -> impl
         usage_hint,
     };
 
-    (
-        StatusCode::OK,
-        Json(ApiResponse::success_with_message("Success", response)),
-    )
+    if !response.available {
+        return Err(zbus::Error::Failure("ModemReadDeferred: waiting for serving cell identity".into()));
+    }
+    Ok(response)
+}
+
+pub async fn get_cell_location_info(State(conn): State<Arc<Connection>>) -> impl IntoResponse {
+    let result = crate::dbus::LOCATION_SNAPSHOT.get(
+        &crate::dbus::snapshot_scope(&conn), std::time::Duration::from_secs(30),
+        read_cell_location_info(&conn),
+    ).await;
+    let response = match result {
+        Ok(data) => ApiResponse::success_with_message("Success", data.as_ref().clone()),
+        Err(error) => ApiResponse::<CellLocationResponse>::error(format!("Failed to get cell location: {}", error)),
+    };
+    (StatusCode::OK, Json(response))
 }
 
 /// GET /api/network/interfaces - 获取所有网络接口详细信息
@@ -1805,25 +1929,25 @@ pub async fn set_radio_mode_handler(
 ///   }
 /// }
 /// ```
-pub async fn get_band_lock_handler(State(conn): State<Arc<Connection>>) -> impl IntoResponse {
+async fn read_band_lock(conn: &Connection) -> zbus::Result<BandLockStatus> {
     // 读取 LTE 频段锁定状态
-    let lte_result = send_at_command(&conn, "AT+SPLBAND=0").await;
+    let lte_result = read_lock_command(conn, "AT+SPLBAND=0", "+SPLBAND:").await;
     let (lte_fdd_mask, lte_tdd_mask, lte_raw) = match lte_result {
         Ok(response) => {
             let (fdd, tdd) = parse_splband_lte_response(&response);
             (fdd, tdd, Some(response))
         }
-        Err(e) => (0, 0, Some(format!("Error: {}", e))),
+        Err(e) => return Err(e),
     };
 
     // 读取 NR 频段锁定状态
-    let nr_result = send_at_command(&conn, "AT+SPLBAND=3").await;
+    let nr_result = read_lock_command(conn, "AT+SPLBAND=3", "+SPLBAND:").await;
     let (nr_fdd_mask, nr_tdd_mask, nr_raw) = match nr_result {
         Ok(response) => {
             let (fdd, tdd) = parse_splband_nr_response(&response);
             (fdd, tdd, Some(response))
         }
-        Err(e) => (0, 0, Some(format!("Error: {}", e))),
+        Err(e) => return Err(e),
     };
 
     // UDX710 设备支持的全部频段掩码
@@ -1875,10 +1999,16 @@ pub async fn get_band_lock_handler(State(conn): State<Arc<Connection>>) -> impl 
         raw_response,
     };
 
-    (
-        StatusCode::OK,
-        Json(ApiResponse::success_with_message("Success", status)),
-    )
+    Ok(status)
+}
+
+pub async fn get_band_lock_handler(State(conn): State<Arc<Connection>>) -> impl IntoResponse {
+    let response = match BAND_LOCK_SNAPSHOT.get(&crate::dbus::snapshot_scope(&conn),
+        std::time::Duration::from_secs(30), read_band_lock(&conn)).await {
+        Ok(status) => ApiResponse::success_with_message("Success", status.as_ref().clone()),
+        Err(error) => ApiResponse::<BandLockStatus>::error(error.to_string()),
+    };
+    (StatusCode::OK, Json(response))
 }
 
 /// POST /api/system/reboot - 系统重启
@@ -2153,46 +2283,38 @@ fn parse_spforcefrq_query_response(response: &str, rat: u8) -> CellLockRatStatus
 ///   }
 /// }
 /// ```
-pub async fn get_cell_lock_handler(State(conn): State<Arc<Connection>>) -> impl IntoResponse {
+async fn read_lock_command(conn: &Connection, command: &str, prefix: &str) -> zbus::Result<String> {
+    let response = send_at_read_command(conn, command).await?;
+    if !response.lines().any(|line| line.trim() == "OK") || !response.contains(prefix) {
+        return Err(zbus::Error::Failure(format!("{command} returned an invalid response: {}", response.trim())));
+    }
+    Ok(response)
+}
+
+async fn read_cell_lock(conn: &Connection) -> zbus::Result<CellLockStatusResponse> {
     let mut rat_status = Vec::new();
     let mut any_locked = false;
     
     // 查询 NR 锁定状态
     let nr_cmd = format!("AT+SPFORCEFRQ={},3", FORCEFRQ_TYPE_NR);
-    if let Ok(response) = send_at_command(&conn, &nr_cmd).await {
+    {
+        let response = read_lock_command(conn, &nr_cmd, "+SPFORCEFRQ:").await?;
         let status = parse_spforcefrq_query_response(&response, FORCEFRQ_TYPE_NR);
         if status.enabled {
             any_locked = true;
         }
         rat_status.push(status);
-    } else {
-        rat_status.push(CellLockRatStatus {
-            rat: FORCEFRQ_TYPE_NR,
-            rat_name: "NR".to_string(),
-            enabled: false,
-            lock_type: 0,
-            pci: None,
-            arfcn: None,
-        });
     }
     
     // 查询 LTE 锁定状态
     let lte_cmd = format!("AT+SPFORCEFRQ={},3", FORCEFRQ_TYPE_LTE);
-    if let Ok(response) = send_at_command(&conn, &lte_cmd).await {
+    {
+        let response = read_lock_command(conn, &lte_cmd, "+SPFORCEFRQ:").await?;
         let status = parse_spforcefrq_query_response(&response, FORCEFRQ_TYPE_LTE);
         if status.enabled {
             any_locked = true;
         }
         rat_status.push(status);
-    } else {
-        rat_status.push(CellLockRatStatus {
-            rat: FORCEFRQ_TYPE_LTE,
-            rat_name: "LTE".to_string(),
-            enabled: false,
-            lock_type: 0,
-            pci: None,
-            arfcn: None,
-        });
     }
     
     let response = CellLockStatusResponse {
@@ -2200,10 +2322,16 @@ pub async fn get_cell_lock_handler(State(conn): State<Arc<Connection>>) -> impl 
         any_locked,
     };
     
-    (
-        StatusCode::OK,
-        Json(ApiResponse::success_with_message("Success", response)),
-    )
+    Ok(response)
+}
+
+pub async fn get_cell_lock_handler(State(conn): State<Arc<Connection>>) -> impl IntoResponse {
+    let response = match CELL_LOCK_SNAPSHOT.get(&crate::dbus::snapshot_scope(&conn),
+        std::time::Duration::from_secs(30), read_cell_lock(&conn)).await {
+        Ok(status) => ApiResponse::success_with_message("Success", status.as_ref().clone()),
+        Err(error) => ApiResponse::<CellLockStatusResponse>::error(error.to_string()),
+    };
+    (StatusCode::OK, Json(response))
 }
 
 /// POST /api/cell-lock - 设置小区锁定
@@ -3020,21 +3148,17 @@ pub async fn set_apn_handler(
 pub async fn get_connectivity_check(
     State(conn): State<Arc<Connection>>,
 ) -> (StatusCode, Json<ApiResponse<ConnectivityCheckResponse>>) {
-    let (ipv4_target, ipv6_target) = connectivity_targets(&conn).await;
-    let (ipv4_result, ipv6_result) = tokio::join!(
-        ping_host(ipv4_target, false),
-        ping_host(ipv6_target, true),
-    );
-    
-    let response = ConnectivityCheckResponse {
-        ipv4: ipv4_result,
-        ipv6: ipv6_result,
+    let result = crate::dbus::CONNECTIVITY_SNAPSHOT.get(&crate::dbus::snapshot_scope(&conn),
+        std::time::Duration::from_secs(5), async {
+            let (ipv4_target, ipv6_target) = connectivity_targets(&conn).await;
+            let (ipv4, ipv6) = tokio::join!(ping_host(ipv4_target, false), ping_host(ipv6_target, true));
+            Ok(ConnectivityCheckResponse { ipv4, ipv6 })
+        }).await;
+    let response = match result {
+        Ok(data) => ApiResponse::success_with_message("Connectivity check completed", data.as_ref().clone()),
+        Err(error) => ApiResponse::error(error.to_string()),
     };
-    
-    (
-        StatusCode::OK,
-        Json(ApiResponse::success_with_message("Connectivity check completed", response)),
-    )
+    (StatusCode::OK, Json(response))
 }
 
 /// 中国大陆（MCC 460）用阿里 DNS，其他地区用 Cloudflare anycast；无法获取 MCC 时沿用原有目标

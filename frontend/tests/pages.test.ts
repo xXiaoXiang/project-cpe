@@ -31,6 +31,8 @@ const fixtures: Record<string, unknown> = {
   '/band-lock': { locked: false, lte_fdd_bands: [], lte_tdd_bands: [], nr_fdd_bands: [], nr_tdd_bands: [] },
   '/network/operators': { operators: [{ name: 'FAST_OPERATOR', status: 'current', technologies: ['LTE'] }] },
   '/cells': { serving_cell: { tech: 'SLOW_NETWORK', cell_id: 123, tac: 456 }, cells: [] },
+  '/location/cell-info': { available: true, cell_info: { mcc: '454', mnc: '00', lac: 456, cid: 98765001,
+    signal_strength: -95, radio_type: 'lte' }, neighbor_cells: [], usage_hint: '' },
   '/usb-mode': { current_mode: 1, current_mode_name: 'FAST_USB' },
   '/data': { active: true },
   '/airplane-mode': { enabled: false, online: true, powered: true },
@@ -57,7 +59,7 @@ const fixtures: Record<string, unknown> = {
 
 void test('pages update fast endpoints while slow responses survive 1-second refreshes', {
   skip: !browserPath && 'Set BROWSER_PATH to an installed Chromium browser',
-  timeout: 90_000,
+  timeout: 120_000,
 }, async (t) => {
   assert.ok(existsSync(join(dist, 'index.html')), 'Build frontend before running page tests')
   let slowPath = ''
@@ -66,7 +68,10 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
   let aborted = 0
   let downloadResponse: ServerResponse | undefined
   let qosError = ''
+  let cellsDeferred = ''
+  let euiccError = ''
   let selectionWarning: string | null = null
+  let selectionPending = false
   const controlWrites: { path: string; payload: Record<string, boolean>; response: ServerResponse }[] = []
   let notifications: EuiccNotification[] = [
     { seqNumber: 29, iccid: '8965012512294623745', profileManagementOperation: 'future-operation' },
@@ -105,6 +110,16 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
         res.end(JSON.stringify({ status: 'error', message: qosError }))
         return
       }
+      if (endpoint === '/cells' && cellsDeferred) {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ status: 'deferred', message: cellsDeferred, retry_after_ms: 5000 }))
+        return
+      }
+      if (endpoint === '/euicc' && euiccError) {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ status: 'error', message: euiccError }))
+        return
+      }
       if (endpoint === '/euicc/notifications') { jsonReply(res, notifications); return }
       if (endpoint.startsWith('/euicc/') && req.method === 'POST') {
         void (async () => {
@@ -127,7 +142,8 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
             const info = fixtures['/euicc'] as { profiles: EuiccProfile[] }
             info.profiles = info.profiles.map((profile) => ({ ...profile,
               profileState: profile.iccid === payload.iccid ? 'enabled' : 'disabled' }))
-            jsonReply(res, { iccid: payload.iccid, profiles: info.profiles, network_selection_warning: selectionWarning })
+            jsonReply(res, { iccid: payload.iccid, profiles: info.profiles, network_selection_submitted: true,
+              network_selection_pending: selectionPending, network_selection_warning: selectionWarning })
           } else jsonReply(res, {})
         })().catch(() => { res.writeHead(500); res.end() })
         return
@@ -266,6 +282,62 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
     })
   }
 
+  await t.test('location refresh is independent and preserves location/cells while pending or deferred', async () => {
+    const originalLocation = fixtures['/location/cell-info']
+    slowPath = ''
+    counts = new Map()
+    const location = 'document.querySelector("[data-cell-location]")'
+    const cells = 'document.querySelector("[data-network-cells]")'
+    try {
+      await call('Page.navigate', { url: `${origin}/network` })
+      await waitFor(`${location} !== null`)
+      await evaluate(`${location}.querySelector('.MuiAccordionSummary-root').click()`)
+      await waitFor(`${location}.innerText.includes('98765001')`)
+      await waitFor(`${cells}.innerText.includes('123')`)
+      const locationReads = counts.get('/location/cell-info') ?? 0
+      const cellReads = counts.get('/cells') ?? 0
+      await delay(2200)
+      assert.equal(counts.get('/location/cell-info'), locationReads, 'Location must not follow 1-second page refreshes')
+      assert.ok((counts.get('/cells') ?? 0) > cellReads)
+
+      slowPath = '/location/cell-info'
+      await evaluate(`document.querySelector('button[title="刷新页面"]').click()`)
+      await waitFor(`${location}.querySelector('[aria-label="正在更新基站定位参数"]') !== null`)
+      await waitFor(`${location}.innerText.includes('正在更新，保留上次结果')`)
+      assert.equal(await evaluate(`${location}.innerText.includes('98765001')`), true)
+      const heldBy = Date.now() + 5000
+      while (!held.size && Date.now() < heldBy) await delay(50)
+      assert.equal(held.size, 1)
+      cellsDeferred = 'ModemReadDeferred: state changed during read'
+      for (const response of held) {
+        response.writeHead(200, { 'Content-Type': 'application/json' })
+        response.end(JSON.stringify({ status: 'deferred', message: cellsDeferred, retry_after_ms: 5000 }))
+      }
+      held.clear()
+      await waitFor(`${location}.innerText.includes('当前显示上次结果')`)
+      await waitFor(`${cells}.innerText.includes('上次结果')`)
+      assert.equal(await evaluate(`${location}.innerText.includes('98765001')`), true)
+      assert.equal(await evaluate(`${cells}.innerText.includes('123')`), true)
+
+      fixtures['/location/cell-info'] = { ...(originalLocation as object),
+        cell_info: { mcc: '454', mnc: '00', lac: 457, cid: 98765002, signal_strength: -90, radio_type: 'lte' } }
+      slowPath = ''
+      cellsDeferred = ''
+      await waitFor(`${location}.innerText.includes('98765002')`)
+      assert.equal(await evaluate(`${location}.innerText.includes('98765001')`), false)
+
+      // Older servers may return success with unavailable/empty location data.
+      fixtures['/location/cell-info'] = { available: false, neighbor_cells: [], usage_hint: '' }
+      await evaluate(`document.querySelector('button[title="刷新页面"]').click()`)
+      await waitFor(`${location}.innerText.includes('当前显示上次结果')`)
+      assert.equal(await evaluate(`${location}.innerText.includes('98765002')`), true)
+    } finally {
+      slowPath = ''
+      cellsDeferred = ''
+      fixtures['/location/cell-info'] = originalLocation
+    }
+  })
+
   await t.test('carrier logos and HK badges follow the current registered PLMN', async () => {
     const originalNetwork = fixtures['/network']
     slowPath = ''
@@ -287,7 +359,49 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
     fixtures['/network'] = originalNetwork
   })
 
+  await t.test('network type follows ofono even when an older backend includes an AT-derived NSA label', async () => {
+    const originalNetwork = fixtures['/network']
+    slowPath = ''
+    fixtures['/network'] = { ...(originalNetwork as object), technology: 'LTE', network_type: '5G NSA', access_technology: 13 }
+    await call('Page.navigate', { url: `${origin}/` })
+    const technology = 'document.querySelector("[data-network-technology]")'
+    await waitFor(`${technology}?.innerText === 'LTE'`)
+    fixtures['/network'] = { ...(originalNetwork as object), technology: 'NR' }
+    await waitFor(`${technology}?.innerText === 'NR'`)
+    for (const reported of ['ENDC', 'en-dc']) {
+      fixtures['/network'] = { ...(originalNetwork as object), technology: reported }
+      await waitFor(`${technology}?.innerText === '5G NSA'`)
+    }
+    const originalIms = fixtures['/ims/status']
+    fixtures['/ims/status'] = { registered: false }
+    fixtures['/network'] = { ...(originalNetwork as object), technology: 'ENDC', mcc: '454', mnc: '00', signal_strength: 100 }
+    const overview = 'document.querySelector("[data-network-overview]")'
+    await waitFor(`${overview}?.querySelector('img')?.alt === 'CSL' && !${overview}.innerText.includes('VoLTE')`)
+    try {
+      for (const width of [360, 375, 390, 414]) {
+        await call('Emulation.setDeviceMetricsOverride', { width, height: 900, deviceScaleFactor: 1, mobile: true })
+        await waitFor('window.innerWidth === ' + width)
+        // The drawer/main width transition must finish after crossing sm.
+        await delay(350)
+        const layout = await evaluate(`(() => {
+          const bounds = Array.from(document.querySelector('[data-network-status-items]').children).map(x => x.getBoundingClientRect());
+          const centers = bounds.map(x => (x.top + x.bottom) / 2);
+          return { sameRow: Math.max(...centers) - Math.min(...centers) < 1,
+            available: document.querySelector('[data-network-status-items]').clientWidth,
+            items: Array.from(document.querySelector('[data-network-status-items]').children).map((x, i) => ({ text: x.innerText, width: bounds[i].width, center: centers[i] })) };
+        })()`) as { sameRow: boolean }
+        assert.equal(layout.sameRow, true, `Status items fit on one row at ${width}px: ${JSON.stringify(layout)}`)
+        assert.equal(await evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true)
+      }
+    } finally {
+      fixtures['/ims/status'] = originalIms
+      fixtures['/network'] = originalNetwork
+      await call('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false })
+    }
+  })
+
   await t.test('modem startup, busy recovery, airplane display and actual technology', async () => {
+    await call('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'no-preference' }] })
     slowPath = '/cells'
     counts = new Map()
     await call('Page.navigate', { url: `${origin}/` })
@@ -316,6 +430,9 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
     fixtures['/airplane-mode'] = { enabled: true, powered: true, online: false }
     // Deliberately leave network/device fixtures registered/online to expose stale data conflicts.
     await waitFor(`${overview}?.innerText.includes('飞行模式')`)
+    await waitFor(`document.querySelector('[data-cell-snapshot]').innerText.includes('上次结果')`)
+    assert.equal(await evaluate(`document.querySelector('[data-cell-snapshot]').innerText.includes('123')`), true,
+      'The historical cell sample remains visible while the modem is unavailable')
     for (const stale of ['已注册', '已上线', '已离线', 'LTE', '75%', 'VoLTE']) {
       assert.equal(await evaluate(`${overview}.innerText.includes(${JSON.stringify(stale)})`), false)
     }
@@ -429,6 +546,12 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
     await delay(250)
     assert.equal(await evaluate(`${input('roaming')}.checked`), true, 'Late old GET must not overwrite POST confirmation')
 
+    const unconfirmed = await begin('airplane', '正在开启', false)
+    await waitFor(textHas('正在等待设备确认，最多约 60 秒。'))
+    jsonReply(unconfirmed.response, { enabled: false, online: true, powered: true })
+    await waitFor(`${row('airplane')}.getAttribute('aria-busy') === 'false' && !${input('airplane')}.checked`)
+    await waitFor(textHas('请求失败'))
+
     for (const enabled of [true, false]) {
       const action = await begin('airplane', enabled ? '正在开启' : '正在关闭', !enabled)
       assert.deepEqual(action.payload, { enabled })
@@ -448,10 +571,18 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
 
   await t.test('eUICC nickname, notification safety and live download progress', async () => {
     slowPath = ''
+    euiccError = '无法读取 eUICC：LPAC timed out after 10 seconds'
     await call('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false })
     await call('Page.navigate', { url: `${origin}/euicc` })
-    await waitFor(textHas('BetterRoaming'))
     const click = (label: string) => evaluate(`Array.from(document.querySelectorAll('button')).find(x => x.getAttribute('aria-label') === ${JSON.stringify(label)} || x.innerText.trim() === ${JSON.stringify(label)})?.click()`)
+    await waitFor(textHas(euiccError))
+    assert.equal(await evaluate('Array.from(document.querySelectorAll("button")).find(x => x.innerText.trim() === "下载 Profile").disabled'), true)
+    await delay(1200)
+    assert.equal(counts.get('/euicc'), 1, 'A failed probe must not retry automatically')
+    assert.equal(await evaluate('Array.from(document.querySelectorAll("button")).find(x => x.innerText.trim() === "读取 eUICC").disabled'), false)
+    euiccError = ''
+    await click('读取 eUICC')
+    await waitFor(textHas('BetterRoaming'))
     const fill = (label: string, value: string) => evaluate(`(() => {
       const input = Array.from(document.querySelectorAll('input')).find(x => document.querySelector('label[for="' + x.id + '"]')?.innerText.includes(${JSON.stringify(label)}));
       if (!input) throw new Error('Input not found');
@@ -503,15 +634,24 @@ void test('pages update fast endpoints while slow responses survive 1-second ref
     await click('启用 BetterRoaming')
     await waitFor(textHas('启用BetterRoaming会关闭3，确认是否继续？'))
     await evaluate(`document.querySelector('[role="dialog"] .MuiDialogActions-root button:last-child').click()`)
-    await waitFor(textHas('Profile 已切换，但自动选网尚未确认'))
+    await waitFor(`document.querySelector('[data-profile="8944476500020800251"] .MuiChip-label')?.innerText === '已启用'`)
+    await waitFor(textHas('Profile 已切换，已提交自动选网'))
+    assert.equal(await evaluate(textHas('注册网络可能需要1～2分钟')), true)
+    assert.equal(await evaluate(textHas(selectionWarning)), true)
+    assert.equal(await evaluate(textHas('该提示不一定表示选网失败')), true)
     assert.equal(await evaluate('document.querySelector(\'button[aria-label="启用 BetterRoaming"]\').disabled'), true, 'Keep the confirmed new profile enabled even if selection recovery fails')
     assert.equal(await evaluate(textHas('Profile 切换失败')), false)
     selectionWarning = null
+    selectionPending = true
     await click('启用 Singtel')
     await waitFor(textHas('启用Singtel会关闭BetterRoaming，确认是否继续？'))
     await evaluate(`document.querySelector('[role="dialog"] .MuiDialogActions-root button:last-child').click()`)
-    await waitFor(textHas('Profile 已切换，已恢复自动选网'))
+    await waitFor(`document.querySelector('[data-profile="8965012605253617847"] .MuiChip-label')?.innerText === '已启用'`)
+    await waitFor(textHas('Profile 已切换，已提交自动选网'))
+    assert.equal(await evaluate(textHas('注册网络可能需要1～2分钟')), true)
+    assert.equal(await evaluate(textHas('已恢复自动选网')), false)
     assert.equal(await evaluate('document.querySelector(\'button[aria-label="启用 Singtel"]\').disabled'), true)
+    selectionPending = false
 
     await click('通知管理')
     await waitFor(textHas('通知 #28'))

@@ -50,6 +50,7 @@ export interface DashboardData {
   networkInfo: NetworkInfo | null
   dataStatus: boolean | null
   cellsInfo: CellsResponse | null
+  cellsStale: boolean
   qosInfo: QosInfo | null
   airplaneMode: AirplaneModeResponse | null
   imsStatus: ImsStatusResponse | null
@@ -74,7 +75,7 @@ const CONNECTIVITY_MIN_REFRESH_INTERVAL = 15_000
 const CONNECTIVITY_HIDDEN_MIN_REFRESH_INTERVAL = 60_000
 
 export function useDashboardData(refreshInterval: number, refreshKey: number) {
-  const { initialLoading, error, setError, fetchInto, waitingMessage } = useApiRequests()
+  const { initialLoading, error, setError, fetchInto, waitingMessage, waiting } = useApiRequests()
 
   const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null)
   const [simInfo, setSimInfo] = useState<SimInfo | null>(null)
@@ -148,7 +149,7 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
       }),
       fetchInto('network', '网络信息', () => api.getNetworkInfo(), setNetworkInfo, () => setNetworkInfo(null)),
       pendingControlRef.current ? Promise.resolve() : fetchInto('data', '数据连接状态', () => api.getDataStatus(), applyControl((status) => setDataStatus(status.active))),
-      fetchInto('cells', '小区信息', () => api.getCellsInfo(), setCellsInfo, () => setCellsInfo(null)),
+      fetchInto('cells', '小区信息', () => api.getCellsInfo(), setCellsInfo),
       fetchInto('qos', 'QoS 信息', () => api.getQosInfo(), setQosInfo, () => setQosInfo(null)),
       pendingControlRef.current ? Promise.resolve() : fetchInto('airplane', '飞行模式状态', () => api.getAirplaneMode(), applyControl(setAirplaneMode)),
       fetchInto('ims', 'IMS 状态', () => api.getImsStatus(), setImsStatus, () => setImsStatus(null)),
@@ -194,7 +195,13 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
 
   const toggleAirplaneMode = useCallback(async () => {
     if (!airplaneMode) return
-    await changeControl('airplane', !airplaneMode.enabled, () => api.setAirplaneMode(!airplaneMode.enabled), setAirplaneMode)
+    const target = !airplaneMode.enabled
+    await changeControl('airplane', target, () => api.setAirplaneMode(target), (status) => {
+      if (status.enabled !== target || status.online !== !target) {
+        throw new Error('设备尚未确认飞行模式切换，请稍后检查状态')
+      }
+      setAirplaneMode(status)
+    })
   }, [airplaneMode, changeControl])
 
   const toggleRoaming = useCallback(async () => {
@@ -226,7 +233,8 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
       systemStats,
       networkInfo,
       dataStatus,
-      cellsInfo: airplaneMode?.enabled || !['registered', 'roaming'].includes(networkInfo?.registration_status ?? '') ? null : cellsInfo,
+      cellsInfo,
+      cellsStale: !!waiting.cells || airplaneMode?.enabled === true || !['registered', 'roaming'].includes(networkInfo?.registration_status ?? ''),
       qosInfo: airplaneMode?.enabled || !['registered', 'roaming'].includes(networkInfo?.registration_status ?? '') ? null : qosInfo,
       airplaneMode,
       imsStatus,

@@ -109,7 +109,7 @@ class UDX710API {
   }
 
   async enableEuiccProfile(iccid: string) {
-    return request<ApiResponse<{ iccid: string; profiles: EuiccProfile[]; network_selection_warning?: string | null }>>('/euicc/profile/enable', {
+    return request<ApiResponse<{ iccid: string; profiles: EuiccProfile[]; network_selection_submitted?: boolean; network_selection_pending?: boolean; network_selection_warning?: string | null }>>('/euicc/profile/enable', {
       method: 'POST',
       body: JSON.stringify({ iccid }),
     })

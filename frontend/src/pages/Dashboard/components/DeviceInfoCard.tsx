@@ -21,9 +21,12 @@ interface DeviceInfoCardProps {
 
 export function DeviceInfoCard({ deviceInfo, systemStats }: DeviceInfoCardProps) {
   const [showInfo, setShowInfo] = useSensitiveVisibility()
+  const manufacturer = deviceInfo?.manufacturer
+  const model = deviceInfo?.model
+  const manufacturerModel = manufacturer && model ? `${manufacturer}（${model}）` : manufacturer || model || 'N/A'
 
   return (
-    <Card>
+    <Card sx={{ containerType: 'inline-size', minWidth: 0 }}>
       <CardContent sx={{ py: 1.5, '&:last-child': { pb: 1.5 } }}>
         <Box display="flex" alignItems="center" justifyContent="space-between" mb={1}>
           <Box display="flex" alignItems="center" gap={1}>
@@ -39,14 +42,12 @@ export function DeviceInfoCard({ deviceInfo, systemStats }: DeviceInfoCardProps)
           </Tooltip>
         </Box>
         <Box
-          display="flex"
-          flexWrap="wrap"
-          gap={2}
           sx={{
-            '& > div': {
-              minWidth: { xs: '45%', sm: '100px' },
-              flex: '1 1 auto',
-            },
+            display: 'grid',
+            gridTemplateColumns: { xs: 'minmax(0, 1fr)', sm: 'repeat(2, minmax(0, 1fr))' },
+            '@container (max-width: 279px)': { gridTemplateColumns: 'minmax(0, 1fr)' },
+            gap: 1.5,
+            '& > div': { minWidth: 0, overflowWrap: 'anywhere' },
           }}
         >
           <Box>
@@ -59,18 +60,10 @@ export function DeviceInfoCard({ deviceInfo, systemStats }: DeviceInfoCardProps)
           </Box>
           <Box>
             <Typography variant="caption" color="text.secondary">
-              制造商
+              制造商（型号）
             </Typography>
             <Typography variant="body2" fontSize="0.75rem">
-              {deviceInfo?.manufacturer || 'N/A'}
-            </Typography>
-          </Box>
-          <Box>
-            <Typography variant="caption" color="text.secondary">
-              型号
-            </Typography>
-            <Typography variant="body2" fontSize="0.75rem">
-              {deviceInfo?.model || 'N/A'}
+              {manufacturerModel}
             </Typography>
           </Box>
           <Box>
@@ -85,7 +78,7 @@ export function DeviceInfoCard({ deviceInfo, systemStats }: DeviceInfoCardProps)
             <Typography variant="caption" color="text.secondary">
               内核
             </Typography>
-            <Typography variant="body2" fontSize="0.75rem" noWrap>
+            <Typography variant="body2" fontSize="0.75rem">
               {systemStats?.system_info?.release || '-'}
             </Typography>
           </Box>

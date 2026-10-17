@@ -105,7 +105,7 @@ pub struct CellInfo {
 }
 
 /// 小区信息响应
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Default, Clone)]
 pub struct CellsResponse {
     /// 主服务小区
     #[serde(default)]
@@ -247,7 +247,7 @@ pub struct EuiccProfile {
 }
 
 /// eUICC 信息与 Profile 列表
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct EuiccInfoResponse {
     pub eid: String,
     pub firmware_version: Option<String>,
@@ -266,7 +266,7 @@ pub struct EuiccNicknameRequest {
     pub nickname: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EuiccNotification {
     pub seq_number: u32,
@@ -352,7 +352,7 @@ pub struct SetUsbModeRequest {
 }
 
 /// USB模式查询响应
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Default, Clone)]
 pub struct UsbModeResponse {
     /// 当前硬件实际运行的模式（始终从 configfs 读取）
     pub current_mode: Option<u8>,
@@ -392,7 +392,7 @@ pub struct NetworkSpeed {
 }
 
 /// 网速信息响应
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Default, Clone)]
 pub struct NetworkSpeedResponse {
     /// 所有网络接口的速度信息
     pub interfaces: Vec<NetworkSpeed>,
@@ -401,7 +401,7 @@ pub struct NetworkSpeedResponse {
 }
 
 /// 内存信息响应
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Default, Clone)]
 pub struct MemoryInfo {
     /// 总内存 (字节)
     pub total_bytes: u64,
@@ -418,7 +418,7 @@ pub struct MemoryInfo {
 }
 
 /// 系统运行时间响应
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Default, Clone)]
 pub struct UptimeInfo {
     /// 系统运行时长（秒）
     pub uptime_seconds: u64,
@@ -429,7 +429,7 @@ pub struct UptimeInfo {
 }
 
 /// 系统信息（uname）
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Default, Clone)]
 pub struct SystemInfo {
     /// 系统名称（如 Linux）
     pub sysname: String,
@@ -449,7 +449,7 @@ pub struct SystemInfo {
 }
 
 /// 综合系统状态响应
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Default, Clone)]
 pub struct SystemStatsResponse {
     /// 网速信息
     pub network_speed: NetworkSpeedResponse,
@@ -470,7 +470,7 @@ pub struct SystemStatsResponse {
 }
 
 /// 磁盘/分区信息
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Default, Clone)]
 pub struct DiskInfo {
     /// 挂载点
     pub mount_point: String,
@@ -500,7 +500,7 @@ pub struct PingResult {
 }
 
 /// 联网检测响应
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Default, Clone)]
 pub struct ConnectivityCheckResponse {
     /// IPv4 连通性
     pub ipv4: PingResult,
@@ -561,7 +561,7 @@ pub struct CpuInfo {
 
 /// 基站定位参数
 /// 用于通过第三方API（如Google Geolocation、OpenCellID等）进行基站定位
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Default, Clone)]
 pub struct CellLocationInfo {
     /// 移动国家代码（如460=中国）
     pub mcc: String,
@@ -590,7 +590,7 @@ pub struct CellLocationInfo {
 }
 
 /// 基站定位信息响应
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Default, Clone)]
 pub struct CellLocationResponse {
     /// 是否可用（是否有足够的定位参数）
     pub available: bool,
@@ -705,7 +705,7 @@ pub struct RadioModeRequest {
 }
 
 /// 频段锁定状态（4G/5G 统一结构）
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Default, Clone)]
 pub struct BandLockStatus {
     /// 是否已锁定频段
     pub locked: bool,
@@ -762,7 +762,7 @@ pub struct CellLockRatStatus {
 }
 
 /// 小区锁定状态响应
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Default, Clone)]
 pub struct CellLockStatusResponse {
     /// 各 RAT 的锁定状态列表
     pub rat_status: Vec<CellLockRatStatus>,

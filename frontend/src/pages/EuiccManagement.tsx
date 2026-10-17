@@ -47,6 +47,7 @@ interface ProfileAction {
 interface Notice {
   severity: 'success' | 'warning' | 'error'
   text: string
+  persistent?: boolean
 }
 
 const emptyDownloadRequest: EuiccDownloadRequest = {
@@ -127,11 +128,15 @@ export default function EuiccManagementPage() {
         if (response.status !== 'ok' || !response.data) {
           throw new Error(response.message || '未确认到目标 Profile 已启用')
         }
-        const { profiles, network_selection_warning: selectionWarning } = response.data
+        const { profiles, network_selection_warning: selectionWarning,
+          network_selection_submitted: selectionSubmitted, network_selection_pending: selectionPending } = response.data
         setEuicc((current) => (current ? { ...current, profiles } : current))
-        setNotice(selectionWarning
-          ? { severity: 'warning', text: `Profile 已切换，但自动选网尚未确认：${selectionWarning}。请在运营商管理中重试自动注册。` }
-          : { severity: 'success', text: selectionWarning === null ? 'Profile 已切换，已恢复自动选网' : 'Profile 已切换' })
+        setNotice({
+          severity: selectionWarning || selectionPending ? 'warning' : 'success',
+          text: `${selectionSubmitted ? 'Profile 已切换，已提交自动选网' : 'Profile 已切换'}。注册网络可能需要1～2分钟，请耐心等待。${selectionWarning
+            ? `设备提示：${selectionWarning}。该提示不一定表示选网失败；若等待后仍未联网，可在运营商管理中重试自动注册。` : ''}`,
+          persistent: true,
+        })
       } else {
         const response = await api.deleteEuiccProfile(action.profile.iccid)
         if (response.status !== 'ok') {
@@ -231,7 +236,7 @@ export default function EuiccManagementPage() {
   }
 
   const hasActivationCode = Boolean(downloadRequest.activation_code?.trim())
-  const euiccUnavailable = !loading && !euicc
+  const euiccUnavailable = !loading && !euicc && loadError !== null
   const canStartDownload = hasActivationCode || Boolean(
     downloadRequest.smdp_address?.trim() && downloadRequest.matching_id?.trim()
   )
@@ -270,9 +275,9 @@ export default function EuiccManagementPage() {
                 variant="outlined"
                 startIcon={loading ? <CircularProgress size={16} /> : <Refresh />}
                 onClick={() => void loadEuicc()}
-                disabled={loading || euiccUnavailable || deviceBusy}
+                disabled={loading || deviceBusy}
               >
-                刷新
+                {euicc ? '刷新' : '读取 eUICC'}
               </Button>
             </span>
           </Tooltip>
@@ -417,7 +422,7 @@ export default function EuiccManagementPage() {
             )
           })}
         </Box>
-      ) : !loading && !loadError ? (
+      ) : euicc && !loading && !loadError ? (
         <Alert severity="info">eUICC 已就绪，当前没有已安装的 Profile。</Alert>
       ) : null}
 
@@ -601,7 +606,7 @@ export default function EuiccManagementPage() {
         </DialogActions>
       </Dialog>
 
-      <Snackbar open={notice !== null} autoHideDuration={6000} onClose={() => setNotice(null)}>
+      <Snackbar open={notice !== null} autoHideDuration={notice?.persistent ? null : 6000} onClose={() => setNotice(null)}>
         <Alert onClose={() => setNotice(null)} severity={notice?.severity || 'success'} variant="filled">
           {notice?.text}
         </Alert>

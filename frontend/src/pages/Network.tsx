@@ -72,7 +72,7 @@ import Grid from '@mui/material/Grid'
 import { api, type RadioMode, type BandLockStatus, type BandLockRequest } from '../api'
 import { useRefreshInterval } from '../contexts/RefreshContext'
 import { useApiRequests } from '../hooks/useApiRequests'
-import { useAdaptivePolling } from '../hooks/useAdaptivePolling'
+import { useAdaptivePolling, useCompletionPolling } from '../hooks/useAdaptivePolling'
 import { useSingleFlight } from '../hooks/useSingleFlight'
 import { useSensitiveVisibility } from '../contexts/revealSensitive'
 import ErrorSnackbar from '../components/ErrorSnackbar'
@@ -107,7 +107,7 @@ function TabPanel(props: TabPanelProps) {
 
 export default function NetworkPage() {
   const { refreshInterval, refreshKey } = useRefreshInterval()
-  const { initialLoading, error, setError, fetchInto, waitingMessage } = useApiRequests()
+  const { initialLoading, error, setError, fetchInto, waitingMessage, waiting } = useApiRequests()
   const run = useSingleFlight()
   const [success, setSuccess] = useState<string | null>(null)
   const [tabValue, setTabValue] = useState(0)
@@ -115,6 +115,9 @@ export default function NetworkPage() {
   const [cellsInfo, setCellsInfo] = useState<CellsResponse | null>(null)
   const [operators, setOperators] = useState<OperatorListResponse | null>(null)
   const [cellLocation, setCellLocation] = useState<CellLocationResponse | null>(null)
+  const [locationRefreshing, setLocationRefreshing] = useState(false)
+  const [locationUpdatedAt, setLocationUpdatedAt] = useState<number | null>(null)
+  const [locationUnavailable, setLocationUnavailable] = useState(false)
   const [scanning, setScanning] = useState(false)
   const [registering, setRegistering] = useState(false)
   
@@ -204,9 +207,8 @@ export default function NetworkPage() {
   // 加载其他数据（自动刷新时调用，不包含频段锁定配置）
   const loadData = useCallback(async () => {
     await Promise.allSettled([
-      fetchInto('cells', '小区信息', () => api.getCellsInfo(), setCellsInfo, () => setCellsInfo(null)),
+      fetchInto('cells', '小区信息', () => api.getCellsInfo(), setCellsInfo),
       fetchInto('operators', '运营商', () => api.getOperators(), setOperators),
-      fetchInto('location', '小区位置', () => api.getCellLocationInfo(), setCellLocation, () => setCellLocation(null)),
       fetchInto('cell-lock', '锁小区状态', () => api.getCellLockStatus(), setCellLockStatus),
       fetchInto('interfaces', '网络接口', () => api.getNetworkInterfaces(), (data) => setInterfaces(data.interfaces)),
       fetchInto('apn', 'APN 配置', () => api.getApnList(), (data) => {
@@ -229,6 +231,35 @@ export default function NetworkPage() {
       }),
     ])
   }, [fetchInto])
+
+  const loadLocation = useCallback(() => run('location-cycle', async () => {
+    let retry: number | undefined
+    setLocationRefreshing(true)
+    try {
+      await fetchInto('location', '小区位置', async () => {
+        try {
+          const response = await api.getCellLocationInfo()
+          if (response.status === 'deferred') retry = Math.max(5000, response.retry_after_ms ?? 5000)
+          else if (response.status !== 'ok' || !response.data?.available) retry = 10_000
+          if (response.status !== 'ok') setLocationUnavailable(true)
+          return response
+        } catch (error) {
+          retry = 10_000
+          setLocationUnavailable(true)
+          throw error
+        }
+      }, (data) => {
+        setLocationUnavailable(!data.available)
+        // A transient empty result from an older backend must not replace the
+        // last useful sample. Pending/deferred/failed reads also preserve it.
+        setCellLocation((previous) => data.available || !previous?.available ? data : previous)
+        if (data.available) setLocationUpdatedAt(Date.now())
+      })
+    } finally {
+      setLocationRefreshing(false)
+    }
+    return retry
+  }), [fetchInto, run])
 
   // 手动刷新频段配置
   const handleRefreshBandConfig = () => {
@@ -586,6 +617,7 @@ export default function NetworkPage() {
 
   // 自动刷新不覆盖用户正在编辑的频段配置。
   useAdaptivePolling({ refreshInterval, refreshKey, onTick: loadData })
+  useCompletionPolling({ interval: 30_000, enabled: refreshInterval > 0, refreshKey, onTick: loadLocation })
 
   const handleTabChange = (_event: React.SyntheticEvent, newValue: number) => {
     setTabValue(newValue)
@@ -788,11 +820,12 @@ export default function NetworkPage() {
           </Alert>
         )}
         
-        <Card>
+        <Card data-network-cells>
           <Box sx={{ p: 1.5, display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 1 }}>
             <Box display="flex" alignItems="center" gap={1} flexWrap="wrap">
               <CellTower fontSize="small" color="primary" />
               <Typography variant="subtitle2" fontWeight="medium">小区列表</Typography>
+              {waiting.cells && cellsInfo && <Chip label="上次结果" size="small" variant="outlined" />}
               {cellsInfo?.cells && (
                 <Chip label={`${cellsInfo.cells.length}`} size="small" color="primary" variant="outlined" />
               )}
@@ -1178,15 +1211,24 @@ export default function NetworkPage() {
         </Card>
 
         {/* 基站定位参数 */}
-        <Card sx={{ mt: 2 }}>
+        <Card sx={{ mt: 2 }} data-cell-location>
           <Accordion>
             <AccordionSummary expandIcon={<ExpandMore />}>
               <Box display="flex" alignItems="center" gap={1}>
                 <MyLocation color="primary" />
                 <Typography variant="subtitle1" fontWeight={600}>基站定位参数</Typography>
+                {locationRefreshing && <CircularProgress size={14} aria-label="正在更新基站定位参数" />}
               </Box>
             </AccordionSummary>
             <AccordionDetails>
+              <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 1 }}>
+                {refreshInterval > 0 ? '每 30 秒自动更新' : '自动刷新已关闭'}
+                {locationUpdatedAt && ` · 上次获取 ${new Date(locationUpdatedAt).toLocaleTimeString()}`}
+                {locationRefreshing && cellLocation?.available && ' · 正在更新，保留上次结果'}
+              </Typography>
+              {locationUnavailable && cellLocation?.available && (
+                <Alert severity="info" sx={{ mb: 1 }}>暂未获取到新的定位参数，当前显示上次结果。</Alert>
+              )}
               {(() => {
                 const cells = getAllLocationCells()
                 return cells.length > 0 ? (

@@ -98,6 +98,11 @@ export function QuickControls({
             />
           </Box>
         </Stack>
+        {pendingControl?.control === 'airplane' && (
+          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1 }}>
+            正在等待设备确认，最多约 60 秒。
+          </Typography>
+        )}
       </CardContent>
     </Card>
   )

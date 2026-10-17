@@ -43,7 +43,7 @@ export default function Dashboard() {
       <StatusOverview
         deviceInfo={data.deviceInfo}
         networkInfo={data.networkInfo}
-        cellsInfo={data.cellsInfo}
+        cellsInfo={data.cellsStale ? null : data.cellsInfo}
         airplaneMode={data.airplaneMode}
         imsStatus={data.imsStatus}
         roaming={data.roaming}
@@ -86,14 +86,19 @@ export default function Dashboard() {
           <TemperatureMonitor systemStats={data.systemStats} />
         </Grid>
 
-        {/* 第三行：小区信息（全宽） */}
+        {/* 第三行：宽屏下小区信息与设备信息按 3:1 并排 */}
         <Grid size={12}>
-          <CellInfo cellsInfo={data.cellsInfo} />
-        </Grid>
-
-        {/* 第四行：设备信息（全宽） */}
-        <Grid size={12}>
-          <DeviceInfoCard deviceInfo={data.deviceInfo} systemStats={data.systemStats} />
+          <Box
+            sx={{
+              display: 'grid',
+              gap: 2,
+              gridTemplateColumns: { xs: 'minmax(0, 1fr)', lg: 'minmax(0, 3fr) minmax(0, 1fr)' },
+              alignItems: 'start',
+            }}
+          >
+            <CellInfo cellsInfo={data.cellsInfo} stale={data.cellsStale} />
+            <DeviceInfoCard deviceInfo={data.deviceInfo} systemStats={data.systemStats} />
+          </Box>
         </Grid>
       </Grid>
     </Box>

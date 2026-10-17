@@ -35,14 +35,15 @@ import type { CellsResponse } from '@/api/types'
 
 interface CellInfoProps {
   cellsInfo: CellsResponse | null
+  stale?: boolean
 }
 
-export function CellInfo({ cellsInfo }: CellInfoProps) {
+export function CellInfo({ cellsInfo, stale = false }: CellInfoProps) {
   const [expanded, setExpanded] = useState(true)
   const [showInfo, setShowInfo] = useSensitiveVisibility()
 
   return (
-    <Card>
+    <Card data-cell-snapshot>
       <Box
         sx={{
           display: 'flex',
@@ -54,11 +55,33 @@ export function CellInfo({ cellsInfo }: CellInfoProps) {
         }}
         onClick={() => setExpanded(!expanded)}
       >
-        <Box display="flex" alignItems="center" gap={1} flexWrap="wrap">
-          <CellTower fontSize="small" color="primary" />
-          <Typography variant="subtitle2" fontWeight="medium">
-            小区信息
-          </Typography>
+        <Box display="flex" alignItems="center" gap={1} flexWrap="wrap" sx={{ minWidth: 0 }}>
+          <Box display="flex" alignItems="center" gap={1}>
+            <CellTower fontSize="small" color="primary" />
+            <Typography variant="subtitle2" fontWeight="medium" sx={{ whiteSpace: 'nowrap' }}>
+              小区信息
+            </Typography>
+          </Box>
+          {cellsInfo?.serving_cell && (
+            <Box
+              sx={{
+                display: 'flex',
+                alignItems: 'center',
+                flexWrap: 'wrap',
+                gap: 0.75,
+                ...getSensitiveStyle(showInfo),
+              }}
+            >
+              <Chip label={cellsInfo.serving_cell.tech?.toUpperCase() || '-'} size="small" color="primary" />
+              <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: 'nowrap' }}>
+                CID: <strong>{cellsInfo.serving_cell.cell_id}</strong>
+              </Typography>
+              <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: 'nowrap' }}>
+                TAC: <strong>{cellsInfo.serving_cell.tac}</strong>
+              </Typography>
+            </Box>
+          )}
+          {stale && cellsInfo && <Chip label="上次结果" size="small" variant="outlined" />}
           <Tooltip title={showInfo ? '隐藏敏感信息' : '显示完整信息'}>
             <IconButton
               size="small"
@@ -71,35 +94,13 @@ export function CellInfo({ cellsInfo }: CellInfoProps) {
             </IconButton>
           </Tooltip>
         </Box>
-        <Box display="flex" alignItems="center" gap={0.5}>
+        <Box display="flex" alignItems="center" gap={0.5} sx={{ flexShrink: 0 }}>
           {cellsInfo?.cells && <Chip label={`${cellsInfo.cells.length}`} size="small" color="primary" variant="outlined" />}
           <IconButton size="small">{expanded ? <ExpandLess /> : <ExpandMore />}</IconButton>
         </Box>
       </Box>
       <Collapse in={expanded}>
         <CardContent sx={{ pt: 0, px: { xs: 1, sm: 2 } }}>
-          {cellsInfo?.serving_cell && (
-            <Box
-              sx={{
-                display: 'flex',
-                flexWrap: 'wrap',
-                gap: 1,
-                mb: 1.5,
-                p: 1,
-                bgcolor: 'action.hover',
-                borderRadius: 1,
-                ...getSensitiveStyle(showInfo),
-              }}
-            >
-              <Chip label={cellsInfo.serving_cell.tech?.toUpperCase() || '-'} size="small" color="primary" />
-              <Typography variant="caption" color="text.secondary" sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                CID: <strong>{cellsInfo.serving_cell.cell_id}</strong>
-              </Typography>
-              <Typography variant="caption" color="text.secondary" sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                TAC: <strong>{cellsInfo.serving_cell.tac}</strong>
-              </Typography>
-            </Box>
-          )}
           <TableContainer component={Paper} variant="outlined" sx={{ maxHeight: 300 }}>
             <Table size="small" stickyHeader>
               <TableHead>

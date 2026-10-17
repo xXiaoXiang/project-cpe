@@ -64,5 +64,5 @@ export function useApiRequests() {
     }
   }), [run])
 
-  return { fetchInto, initialLoading, error: manualError ?? requestError, setError, ready, waitingMessage: Object.values(waiting)[0] ?? null }
+  return { fetchInto, initialLoading, error: manualError ?? requestError, setError, ready, waiting, waitingMessage: Object.values(waiting)[0] ?? null }
 }

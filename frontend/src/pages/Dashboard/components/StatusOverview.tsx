@@ -50,10 +50,12 @@ export function StatusOverview({
 
   const networkTech = (() => {
     if (!radioOnline) return 'N/A'
-    if (networkInfo?.technology && networkInfo.technology !== 'unknown') return networkInfo.technology.toUpperCase()
-    if (cellsInfo?.serving_cell?.tech) {
-      return cellsInfo.serving_cell.tech.toUpperCase()
-    }
+    const technology = networkInfo?.technology && networkInfo.technology.toLowerCase() !== 'unknown'
+      ? networkInfo.technology : cellsInfo?.serving_cell?.tech
+    const reported = technology?.trim().toUpperCase()
+    // EN-DC is the LTE/NR dual connectivity mode reported by oFono itself.
+    if (reported === 'ENDC' || reported === 'EN-DC') return '5G NSA'
+    if (reported) return reported
     return 'N/A'
   })()
 
@@ -85,7 +87,7 @@ export function StatusOverview({
       data-network-overview
       elevation={0}
       sx={{
-        p: 2,
+        p: { xs: 1, sm: 2 },
         mb: 2,
         borderRadius: 2,
         background: (() => {
@@ -99,11 +101,18 @@ export function StatusOverview({
         })(),
       }}
     >
-      <Box display="flex" flexWrap="wrap" alignItems="center" gap={2}>
-        <Box display="flex" alignItems="center" gap={1.5}>
+      <Box data-network-status-items display="flex" flexWrap="wrap" alignItems="center"
+        sx={{
+          gap: { xs: 0.375, sm: 1 },
+          '& > *': { flexShrink: 0 },
+          '& .MuiChip-root': { height: 24, fontSize: { xs: '0.6875rem', sm: '0.8125rem' } },
+          '& .MuiChip-label': { px: { xs: 0.625, sm: 1 } },
+          '& .MuiChip-icon': { fontSize: { xs: 16, sm: 18 }, ml: 0.5, mr: -0.25 },
+        }}>
+        <Box display="flex" alignItems="center" sx={{ gap: { xs: 0.5, sm: 1 } }}>
           {carrierLogo ? (
             <Box sx={{ position: 'relative', display: 'inline-flex', pr: carrierLogoBadge ? 1 : 0 }}>
-              <Box component="img" src={carrierLogo} alt={carrierLabel} title={carrierLabel} sx={{ height: 32, width: 'auto', maxWidth: 160, objectFit: 'contain' }} />
+              <Box component="img" src={carrierLogo} alt={carrierLabel} title={carrierLabel} sx={{ height: { xs: 24, sm: 32 }, width: 'auto', maxWidth: { xs: 92, sm: 160 }, objectFit: 'contain' }} />
               {carrierLogoBadge && (
                 <Box
                   component="span"
@@ -127,25 +136,25 @@ export function StatusOverview({
             />
           )}
           <Box display="flex" alignItems="center" gap={0.5}>
-            <SignalCellularAlt sx={{ fontSize: 24, color: signalColor }} />
-            <Typography variant="h6" fontWeight="bold" color={signalColor}>
+            <SignalCellularAlt sx={{ fontSize: { xs: 20, sm: 24 }, color: signalColor }} />
+            <Typography variant="h6" fontWeight="bold" color={signalColor} sx={{ fontSize: { xs: '0.9375rem', sm: '1.25rem' } }}>
               {signalStrength === undefined ? '--' : `${signalStrength}%`}
             </Typography>
           </Box>
         </Box>
 
         {(searching || networkTech !== 'N/A') && (
-          <Tooltip title={searching ? registrationLabel : waitingMessage ?? ''}>
+          <Tooltip title={[networkTech === '5G NSA' ? 'oFono 报告 EN-DC：LTE 与 NR 双连接（5G NSA）' : '', searching ? registrationLabel : waitingMessage].filter(Boolean).join('；')}>
             <Box
               data-network-technology
               data-searching={searching}
               aria-label={searching ? `${networkTech === 'N/A' ? '-' : networkTech}，${registrationLabel}` : undefined}
-              sx={{ position: 'relative', display: 'inline-flex', p: '3px', borderRadius: 999 }}
+              sx={{ position: 'relative', display: 'inline-flex', p: { xs: '2px', sm: '3px' }, borderRadius: 999 }}
             >
               <Chip
                 icon={<WifiTethering />}
                 label={networkTech === 'N/A' ? '-' : networkTech}
-                color={networkTech === '5G' || networkTech === 'NR' ? 'success' : 'primary'}
+                color={networkTech === '5G' || networkTech === 'NR' || networkTech === '5G NSA' ? 'success' : 'primary'}
                 size="small"
                 sx={{ fontWeight: 'bold' }}
               />
@@ -177,7 +186,11 @@ export function StatusOverview({
           </Tooltip>
         )}
 
-        {radioOnline && !searching && <Chip icon={<Router />} label={registrationLabel} color={registrationColor} variant="outlined" size="small" />}
+        {radioOnline && !searching && (
+          <Tooltip title="蜂窝网络注册状态：来自 oFono NetworkRegistration.Status；已注册不代表数据连接已激活。">
+            <Chip icon={<Router />} label={registrationLabel} color={registrationColor} variant="outlined" size="small" />
+          </Tooltip>
+        )}
 
         {registered && roaming?.is_roaming && (
           <Chip
@@ -188,7 +201,9 @@ export function StatusOverview({
           />
         )}
 
-        <Chip icon={flightMode ? <FlightTakeoff /> : <PowerSettingsNew />} label={modemLabel} color={modemColor} size="small" />
+        <Tooltip title="Modem 状态：来自 oFono Modem.Powered / Online；已上线表示射频已开启，不代表互联网可达。">
+          <Chip icon={flightMode ? <FlightTakeoff /> : <PowerSettingsNew />} label={modemLabel} color={modemColor} size="small" />
+        </Tooltip>
 
         {registered && imsStatus?.registered && <Chip label="VoLTE" color="info" size="small" variant="outlined" />}
       </Box>

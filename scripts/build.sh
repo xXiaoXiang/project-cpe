@@ -173,7 +173,11 @@ if [ "$BUILD_BACKEND" = true ]; then
             exit 1
         fi
         BEFORE_SIZE=$(stat -f%z "$BINARY_PATH" 2>/dev/null || stat -c%s "$BINARY_PATH" 2>/dev/null)
-        upx --best --lzma "$BINARY_PATH"
+        # Cargo 产物可能与缓存文件硬链接，压缩副本以保留原始缓存。
+        cp "$BINARY_PATH" "${BINARY_PATH}.upx-input"
+        upx --best --lzma "${BINARY_PATH}.upx-input"
+        upx --test "${BINARY_PATH}.upx-input"
+        mv -f "${BINARY_PATH}.upx-input" "$BINARY_PATH"
         AFTER_SIZE=$(stat -f%z "$BINARY_PATH" 2>/dev/null || stat -c%s "$BINARY_PATH" 2>/dev/null)
         RATIO=$(echo "scale=1; 100 - ($AFTER_SIZE * 100 / $BEFORE_SIZE)" | bc)
         echo "压缩完成！节省: ${RATIO}%"

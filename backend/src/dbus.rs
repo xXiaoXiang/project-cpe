@@ -13,7 +13,7 @@
 //! 处理与 ofono D-Bus 服务的通信
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tracing::{info, warn};
 use zbus::{proxy, zvariant::OwnedValue, Connection, Proxy};
@@ -23,8 +23,147 @@ use crate::models::{
     AirplaneModeResponse, ApnContext, DeviceInfoResponse, NetworkInfoResponse, QosInfoResponse, RadioMode,
     RadioModeResponse, ServingCell, SimInfoResponse,
 };
-use crate::serial::{with_modem_read, with_serial};
+use crate::serial::{with_modem_read, with_modem_write, with_serial, ReadSnapshot};
 use crate::state::FrontendRuntime;
+
+type Properties = HashMap<String, OwnedValue>;
+type Contexts = Vec<(zbus::zvariant::OwnedObjectPath, Properties)>;
+static CONTEXT_SNAPSHOT: ReadSnapshot<Contexts> = ReadSnapshot::new();
+
+async fn snapshot_contexts(conn: &Connection) -> zbus::Result<Arc<Contexts>> {
+    CONTEXT_SNAPSHOT.get(&snapshot_scope(conn), Duration::from_secs(1), async {
+        let proxy = Proxy::new(conn, "org.ofono", "/ril_0", "org.ofono.ConnectionManager").await?;
+        proxy.call("GetContexts", &()).await
+    }).await
+}
+
+// Volatile properties are shared across a dashboard refresh; slow-changing SIM
+// and settings properties also have signal invalidation and a bounded fallback TTL.
+static PROPERTY_SNAPSHOTS: LazyLock<HashMap<&'static str, (Duration, ReadSnapshot<Properties>)>> = LazyLock::new(|| {
+    [
+        ("org.ofono.Modem", 1),
+        ("org.ofono.NetworkRegistration", 1),
+        ("org.ofono.ConnectionManager", 1),
+        ("org.ofono.RadioSettings", 30),
+        ("org.ofono.SimManager", 30),
+        ("org.ofono.MessageManager", 30),
+        ("org.ofono.IpMultimediaSystem", 3),
+    ].into_iter().map(|(interface, seconds)| (interface, (Duration::from_secs(seconds), ReadSnapshot::new()))).collect()
+});
+
+pub static CELL_SNAPSHOT: ReadSnapshot<crate::models::CellsResponse> = ReadSnapshot::new();
+pub static LOCATION_SNAPSHOT: ReadSnapshot<crate::models::CellLocationResponse> = ReadSnapshot::new();
+pub static CONNECTIVITY_SNAPSHOT: ReadSnapshot<crate::models::ConnectivityCheckResponse> = ReadSnapshot::new();
+static SERVING_SNAPSHOT: ReadSnapshot<ServingCell> = ReadSnapshot::new();
+static QOS_SNAPSHOT: ReadSnapshot<String> = ReadSnapshot::new();
+static SLOT_SNAPSHOT: ReadSnapshot<String> = ReadSnapshot::new();
+static IMEISV_SNAPSHOT: ReadSnapshot<Properties> = ReadSnapshot::new();
+static OPERATOR_SNAPSHOT: ReadSnapshot<Contexts> = ReadSnapshot::new();
+
+pub fn snapshot_scope(conn: &Connection) -> String {
+    conn.unique_name().map(ToString::to_string).unwrap_or_default()
+}
+
+async fn snapshot_properties(conn: &Connection, interface: &str) -> zbus::Result<Arc<Properties>> {
+    let (ttl, cache) = PROPERTY_SNAPSHOTS.get(interface).expect("known dashboard interface");
+    cache.get(&snapshot_scope(conn), *ttl, async {
+        let fetch = async {
+            let proxy = Proxy::new(conn, "org.ofono", "/ril_0", interface).await?;
+            proxy.call("GetProperties", &()).await
+        };
+        // Cheap oFono property snapshots do not queue behind slow diagnostics.
+        // SIM/IMS keep their existing recovery/backoff policy.
+        if matches!(interface, "org.ofono.SimManager" | "org.ofono.MessageManager" | "org.ofono.IpMultimediaSystem") {
+            with_modem_read(interface, fetch).await
+        } else {
+            fetch.await
+        }
+    }).await
+}
+
+fn invalidate_diagnostics() {
+    CELL_SNAPSHOT.invalidate();
+    LOCATION_SNAPSHOT.invalidate();
+    SERVING_SNAPSHOT.invalidate();
+    QOS_SNAPSHOT.invalidate();
+    CONNECTIVITY_SNAPSHOT.invalidate();
+}
+
+fn invalidate_property_snapshot(interface: &str, property: &str) {
+    if let Some((_, cache)) = PROPERTY_SNAPSHOTS.get(interface) {
+        cache.invalidate();
+    }
+    if interface == "org.ofono.ConnectionContext" {
+        CONTEXT_SNAPSHOT.invalidate();
+    }
+    if interface == "org.ofono.NetworkOperator" || (interface == "org.ofono.NetworkRegistration"
+        && matches!(property, "Status" | "Name" | "MobileCountryCode" | "MobileNetworkCode")) {
+        OPERATOR_SNAPSHOT.invalidate();
+    }
+    match (interface, property) {
+        ("org.ofono.Modem", "Online" | "Powered" | "Interfaces") |
+        ("org.ofono.SimManager", "Present" | "CardIdentifier" | "SubscriberIdentity") => {
+            crate::serial::invalidate_modem_snapshots();
+        }
+        ("org.ofono.NetworkRegistration", "Status" | "Technology" | "CellId" | "LocationAreaCode" | "MobileCountryCode" | "MobileNetworkCode") |
+        ("org.ofono.NetworkMonitor", "Technology" | "CellId" | "NCellId" | "TrackingAreaCode") |
+        ("org.ofono.ConnectionManager", "Attached" | "Bearer" | "NRConnected") |
+        ("org.ofono.ConnectionContext", "Active" | "AccessPointName") => invalidate_diagnostics(),
+        _ => {}
+    }
+}
+
+/// Listen before serving requests. Signals only invalidate snapshots; they never
+/// run modem commands. TTLs still guarantee refresh if a vendor omits a signal.
+pub async fn start_snapshot_invalidation(conn: &Connection) -> zbus::Result<()> {
+    use futures_util::StreamExt;
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender("org.ofono")?
+        .build();
+    let mut stream = zbus::MessageStream::for_match_rule(rule, conn, Some(128)).await?;
+    let owner_rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender("org.freedesktop.DBus")?
+        .interface("org.freedesktop.DBus")?
+        .member("NameOwnerChanged")?
+        .add_arg("org.ofono")?
+        .build();
+    let mut owner_stream = zbus::MessageStream::for_match_rule(owner_rule, conn, Some(8)).await?;
+    tokio::spawn(async move {
+        while owner_stream.next().await.is_some() {
+            crate::serial::invalidate_modem_snapshots();
+        }
+        crate::serial::invalidate_modem_snapshots();
+    });
+    tokio::spawn(async move {
+        while let Some(message) = stream.next().await {
+            let Ok(message) = message else {
+                crate::serial::invalidate_modem_snapshots();
+                continue;
+            };
+            let header = message.header();
+            let interface = header.interface().map(|name| name.as_str()).unwrap_or("");
+            let member = header.member().map(|name| name.as_str()).unwrap_or("");
+            let path = header.path().map(|path| path.as_str()).unwrap_or("");
+            if member == "PropertyChanged" && (path == "/ril_0" || path.starts_with("/ril_0/")) {
+                if let Ok((property, _)) = message.body().deserialize::<(String, OwnedValue)>() {
+                    invalidate_property_snapshot(interface, &property);
+                }
+            } else if interface == "org.ofono.NetworkRegistration" && matches!(member, "OperatorAdded" | "OperatorRemoved") {
+                OPERATOR_SNAPSHOT.invalidate();
+            } else if interface == "org.ofono.ConnectionManager" && matches!(member, "ContextAdded" | "ContextRemoved") {
+                CONTEXT_SNAPSHOT.invalidate();
+                invalidate_diagnostics();
+            } else if interface == "org.ofono.Manager" && matches!(member, "ModemAdded" | "ModemRemoved") {
+                crate::serial::invalidate_modem_snapshots();
+            }
+        }
+        crate::serial::invalidate_modem_snapshots();
+        warn!("oFono snapshot signal stream ended; snapshot TTL fallback remains active");
+    });
+    Ok(())
+}
 
 /// ofono NetworkMonitor 代理接口
 #[proxy(
@@ -133,7 +272,7 @@ pub trait Modem {
 /// # Returns
 /// AT 指令的响应结果
 pub async fn send_at_command(conn: &Connection, cmd: &str) -> zbus::Result<String> {
-    with_serial(async {
+    with_modem_write(async {
         let proxy = Proxy::new(conn, "org.ofono", "/ril_0", "org.ofono.Modem").await?;
         let result: String = proxy.call("SendAtcmd", &(cmd)).await?;
         Ok(result)
@@ -149,8 +288,18 @@ pub async fn send_at_read_command(conn: &Connection, cmd: &str) -> zbus::Result<
 }
 
 async fn require_registered_network(conn: &Connection) -> zbus::Result<()> {
-    let network = get_network_info_data(conn).await?;
-    if !matches!(network.registration_status.as_str(), "registered" | "roaming") {
+    // Only registration is needed here. In particular, do not read
+    // RadioSettings just to decide whether a cell/QoS query is safe.
+    let modem = snapshot_properties(conn, "org.ofono.Modem").await?;
+    let powered = modem.get("Powered").and_then(|value| bool::try_from(value.clone()).ok()).unwrap_or(false);
+    let online = modem.get("Online").and_then(|value| bool::try_from(value.clone()).ok()).unwrap_or(false);
+    let interfaces = modem.get("Interfaces").and_then(|value| Vec::<String>::try_from(value.clone()).ok());
+    if !powered || !online || interfaces.as_ref().is_some_and(|items| !items.iter().any(|item| item == "org.ofono.NetworkRegistration")) {
+        return Err(zbus::Error::Failure("ModemReadDeferred: waiting for network interface".into()));
+    }
+    let network = snapshot_properties(conn, "org.ofono.NetworkRegistration").await?;
+    let status = network.get("Status").and_then(|value| <&str>::try_from(value).ok()).unwrap_or("");
+    if !matches!(status, "registered" | "roaming") {
         return Err(zbus::Error::Failure("ModemReadDeferred: waiting for network registration".into()));
     }
     Ok(())
@@ -165,7 +314,7 @@ async fn require_registered_network(conn: &Connection) -> zbus::Result<()> {
 /// 服务小区信息结构
 pub async fn get_serving_cell_info(conn: &Connection) -> zbus::Result<ServingCell> {
     require_registered_network(conn).await?;
-    with_modem_read("serving-cell", async {
+    let snapshot = SERVING_SNAPSHOT.get(&snapshot_scope(conn), Duration::from_secs(3), with_modem_read("serving-cell", async {
         let proxy = NetworkMonitorProxy::new(conn).await?;
         let cell_info: HashMap<String, OwnedValue> = proxy.get_serving_cell_information().await?;
 
@@ -181,7 +330,8 @@ pub async fn get_serving_cell_info(conn: &Connection) -> zbus::Result<ServingCel
         let tac = parse_u32_from_keys(&cell_info, &["TrackingAreaCode"]);
 
         Ok(ServingCell { tech, cell_id, tac })
-    }).await
+    })).await?;
+    Ok(snapshot.as_ref().clone())
 }
 
 /// 查找第一个有效的 internet 类型 context 路径
@@ -195,13 +345,11 @@ pub async fn get_serving_cell_info(conn: &Connection) -> zbus::Result<ServingCel
 /// # Returns
 /// context 路径字符串
 pub async fn find_internet_context(conn: &Connection) -> zbus::Result<String> {
-    let proxy = Proxy::new(conn, "org.ofono", "/ril_0", "org.ofono.ConnectionManager").await?;
-    let contexts: Vec<(zbus::zvariant::OwnedObjectPath, HashMap<String, OwnedValue>)> = 
-        proxy.call("GetContexts", &()).await?;
+    let contexts = snapshot_contexts(conn).await?;
     
     let mut first_internet_context: Option<String> = None;
     
-    for (path, props) in contexts {
+    for (path, props) in contexts.iter() {
         let context_type = props
             .get("Type")
             .and_then(|v| String::try_from(v.clone()).ok())
@@ -237,13 +385,11 @@ pub async fn find_internet_context(conn: &Connection) -> zbus::Result<String> {
 /// # Returns
 /// APN Context 列表
 pub async fn get_all_apn_contexts(conn: &Connection) -> zbus::Result<Vec<ApnContext>> {
-    let proxy = Proxy::new(conn, "org.ofono", "/ril_0", "org.ofono.ConnectionManager").await?;
-    let contexts: Vec<(zbus::zvariant::OwnedObjectPath, HashMap<String, OwnedValue>)> = 
-        proxy.call("GetContexts", &()).await?;
+    let contexts = snapshot_contexts(conn).await?;
     
     let mut result = Vec::new();
     
-    for (path, props) in contexts {
+    for (path, props) in contexts.iter() {
         let context_type = props
             .get("Type")
             .and_then(|v| String::try_from(v.clone()).ok())
@@ -306,7 +452,7 @@ pub async fn set_apn_property(
     property: &str, 
     value: &str
 ) -> zbus::Result<()> {
-    with_serial(async {
+    with_modem_write(async {
         let proxy = ConnectionContextProxy::builder(conn)
             .path(context_path)?
             .build()
@@ -353,7 +499,7 @@ pub async fn set_apn_properties(
     
     // 如果 context 是激活状态，先关闭它
     if was_active {
-        with_serial(async {
+        with_modem_write(async {
             let proxy = ConnectionContextProxy::builder(conn)
                 .path(context_path)?
                 .build()
@@ -390,7 +536,7 @@ pub async fn set_apn_properties(
     // 如果之前是激活状态，重新激活
     if was_active {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        with_serial(async {
+        with_modem_write(async {
             let proxy = ConnectionContextProxy::builder(conn)
                 .path(context_path)?
                 .build()
@@ -412,7 +558,7 @@ pub async fn set_apn_properties(
 /// # Returns
 /// 操作结果
 pub async fn set_data_connection(conn: &Connection, active: bool) -> zbus::Result<()> {
-    with_serial(async {
+    with_modem_write(async {
         // 自动查找有效的 internet context
         let context_path = find_internet_context(conn).await?;
         
@@ -433,14 +579,21 @@ pub async fn set_data_connection(conn: &Connection, active: bool) -> zbus::Resul
 /// # Returns
 /// 数据连接是否激活
 pub async fn get_data_connection_status(conn: &Connection) -> zbus::Result<bool> {
-    // 自动查找有效的 internet context
-    let context_path = find_internet_context(conn).await?;
-    
-    let proxy = ConnectionContextProxy::builder(conn)
-        .path(context_path)?
-        .build()
-        .await?;
-    let properties = proxy.get_properties().await?;
+    let contexts = snapshot_contexts(conn).await?;
+    // GetContexts already includes Active. Preserve the configured-APN priority
+    // used by find_internet_context without a second GetProperties round trip.
+    let internet = |props: &Properties| props.get("Type").and_then(|v| <&str>::try_from(v).ok()) == Some("internet");
+    let selected = contexts.iter().find(|(_, props)| internet(props) && props.get("AccessPointName")
+        .and_then(|v| <&str>::try_from(v).ok()).is_some_and(|apn| !apn.is_empty()))
+        .or_else(|| contexts.iter().find(|(_, props)| internet(props)));
+    let properties = if let Some((_, props)) = selected {
+        props
+    } else {
+        // Retain the legacy context2 fallback when no internet context exists.
+        let proxy = ConnectionContextProxy::new(conn).await?;
+        return Ok(proxy.get_properties().await?.get("Active")
+            .and_then(|v| bool::try_from(v.clone()).ok()).unwrap_or(false));
+    };
     
     let active = properties
         .get("Active")
@@ -459,8 +612,7 @@ pub async fn get_data_connection_status(conn: &Connection) -> zbus::Result<bool>
 /// (roaming_allowed, is_roaming) 元组
 pub async fn get_roaming_status(conn: &Connection) -> zbus::Result<(bool, bool)> {
     // 获取 ConnectionManager 的 RoamingAllowed 属性
-    let cm_proxy = Proxy::new(conn, "org.ofono", "/ril_0", "org.ofono.ConnectionManager").await?;
-    let cm_props: std::collections::HashMap<String, OwnedValue> = cm_proxy.call("GetProperties", &()).await?;
+    let cm_props = snapshot_properties(conn, "org.ofono.ConnectionManager").await?;
     
     let roaming_allowed = cm_props
         .get("RoamingAllowed")
@@ -468,8 +620,7 @@ pub async fn get_roaming_status(conn: &Connection) -> zbus::Result<(bool, bool)>
         .unwrap_or(false);
     
     // 获取 NetworkRegistration 的 Status 属性判断是否漫游
-    let net_proxy = NetworkRegistrationProxy::new(conn).await?;
-    let net_props = net_proxy.get_properties().await?;
+    let net_props = snapshot_properties(conn, "org.ofono.NetworkRegistration").await?;
     
     let status = net_props
         .get("Status")
@@ -490,7 +641,7 @@ pub async fn get_roaming_status(conn: &Connection) -> zbus::Result<(bool, bool)>
 /// # Returns
 /// 操作结果
 pub async fn set_roaming_allowed(conn: &Connection, allowed: bool) -> zbus::Result<()> {
-    with_serial(async {
+    with_modem_write(async {
         let proxy = Proxy::new(conn, "org.ofono", "/ril_0", "org.ofono.ConnectionManager").await?;
         let value = zbus::zvariant::Value::Bool(allowed);
         proxy.call::<_, _, ()>("SetProperty", &("RoamingAllowed", value)).await?;
@@ -818,12 +969,8 @@ pub async fn data_connection_watchdog(
 /// # Returns
 /// SIM 卡信息结构（整合 SimManager + MessageManager）
 pub async fn get_sim_info_data(conn: &Connection) -> zbus::Result<SimInfoResponse> {
-    with_modem_read("sim", async {
-    let sim_proxy = SimManagerProxy::new(conn).await?;
-    let msg_proxy = MessageManagerProxy::new(conn).await?;
-    
-    let sim_props = sim_proxy.get_properties().await?;
-    let msg_props = msg_proxy.get_properties().await?;
+    let sim_props = snapshot_properties(conn, "org.ofono.SimManager").await?;
+    let msg_props = snapshot_properties(conn, "org.ofono.MessageManager").await?;
 
     // 基本状态
     let present = sim_props
@@ -889,7 +1036,6 @@ pub async fn get_sim_info_data(conn: &Connection) -> zbus::Result<SimInfoRespons
         pin_required,
         preferred_languages,
     })
-    }).await
 }
 
 /// 请求 Modem 刷新当前 SIM/eUICC 状态
@@ -904,8 +1050,7 @@ pub async fn refresh_sim(conn: &Connection) -> zbus::Result<()> {
 
 /// 读取当前注册网络的 MCC（不走全局锁）
 pub async fn get_registered_mcc(conn: &Connection) -> Option<String> {
-    let proxy = NetworkRegistrationProxy::new(conn).await.ok()?;
-    let props = proxy.get_properties().await.ok()?;
+    let props = snapshot_properties(conn, "org.ofono.NetworkRegistration").await.ok()?;
     props
         .get("MobileCountryCode")
         .and_then(|value| String::try_from(value.clone()).ok())
@@ -920,8 +1065,7 @@ pub async fn get_registered_mcc(conn: &Connection) -> Option<String> {
 /// # Returns
 /// 网络信息结构
 pub async fn get_network_info_data(conn: &Connection) -> zbus::Result<NetworkInfoResponse> {
-    let modem = ModemProxy::new(conn).await?;
-    let props = modem.get_properties().await?;
+    let props = snapshot_properties(conn, "org.ofono.Modem").await?;
     let powered = props.get("Powered").and_then(|v| bool::try_from(v.clone()).ok()).unwrap_or(false);
     let online = props.get("Online").and_then(|v| bool::try_from(v.clone()).ok()).unwrap_or(false);
     if !powered || !online {
@@ -935,10 +1079,7 @@ pub async fn get_network_info_data(conn: &Connection) -> zbus::Result<NetworkInf
     if interfaces.as_ref().is_some_and(|items| !items.iter().any(|item| item == "org.ofono.NetworkRegistration")) {
         return Ok(NetworkInfoResponse { registration_status: "initializing".into(), ..Default::default() });
     }
-    let net_proxy = NetworkRegistrationProxy::new(conn).await?;
-    let radio_proxy = RadioSettingsProxy::new(conn).await?;
-    
-    let net_props = match net_proxy.get_properties().await {
+    let net_props = match snapshot_properties(conn, "org.ofono.NetworkRegistration").await {
         Ok(properties) => properties,
         Err(error) if error.to_string().contains("UnknownMethod") || error.to_string().contains("UnknownInterface") => {
             // Interfaces may disappear between the Modem snapshot and this call.
@@ -947,12 +1088,12 @@ pub async fn get_network_info_data(conn: &Connection) -> zbus::Result<NetworkInf
         Err(error) => return Err(error),
     };
     let radio_props = if interfaces.as_ref().is_none_or(|items| items.iter().any(|item| item == "org.ofono.RadioSettings")) {
-        match radio_proxy.get_properties().await {
+        match snapshot_properties(conn, "org.ofono.RadioSettings").await {
             Ok(properties) => properties,
-            Err(error) if error.to_string().contains("UnknownMethod") || error.to_string().contains("UnknownInterface") => HashMap::new(),
+            Err(error) if error.to_string().contains("UnknownMethod") || error.to_string().contains("UnknownInterface") => Arc::new(HashMap::new()),
             Err(error) => return Err(error),
         }
-    } else { HashMap::new() };
+    } else { Arc::new(HashMap::new()) };
 
     let operator_name = net_props
         .get("Name")
@@ -1001,8 +1142,7 @@ pub async fn get_network_info_data(conn: &Connection) -> zbus::Result<NetworkInf
 /// # Returns
 /// 设备信息结构
 pub async fn get_device_info_data(conn: &Connection) -> zbus::Result<DeviceInfoResponse> {
-    let proxy = ModemProxy::new(conn).await?;
-    let props = proxy.get_properties().await?;
+    let props = snapshot_properties(conn, "org.ofono.Modem").await?;
 
     let imei = props
         .get("Serial")
@@ -1052,7 +1192,8 @@ pub async fn get_device_info_data(conn: &Connection) -> zbus::Result<DeviceInfoR
 /// QoS信息结构
 pub async fn get_qos_info_data(conn: &Connection) -> zbus::Result<QosInfoResponse> {
     require_registered_network(conn).await?;
-    let response = send_at_read_command(conn, "AT+CGEQOSRDP").await?;
+    let response = QOS_SNAPSHOT.get(&snapshot_scope(conn), Duration::from_secs(5),
+        send_at_read_command(conn, "AT+CGEQOSRDP")).await?;
     
     // 解析 +CGEQOSRDP: <cid>,<QCI>,[<DL_GBR>,<UL_GBR>],[<DL_MBR>,<UL_MBR>],[<DL_AMBR>,<UL_AMBR>]
     let parsed = parse_qos_response(&response);
@@ -1146,19 +1287,33 @@ fn parse_u32_from_keys(cell_info: &HashMap<String, OwnedValue>, keys: &[&str]) -
 /// 飞行模式通过设置 Modem 的 Online 属性实现：
 /// - Online = false: 关闭射频，进入飞行模式（但 Modem 保持上电）
 /// - Online = true: 开启射频，退出飞行模式
-pub async fn set_airplane_mode(conn: &Connection, enabled: bool) -> zbus::Result<()> {
+pub async fn set_airplane_mode(conn: &Connection, enabled: bool) -> zbus::Result<AirplaneModeResponse> {
     let _modem_change = crate::serial::modem_change();
-    with_serial(async {
-        let proxy = ModemProxy::new(conn).await?;
-        
-        // 飞行模式：设置 Online 为相反值
-        // enabled=true 表示开启飞行模式，即 Online=false
-        proxy
-            .set_property("Online", zbus::zvariant::Value::Bool(!enabled))
-            .await?;
-        
-        Ok(())
-    }).await
+    // Include time queued behind another command and bus setup in the limit.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let work = with_serial(async {
+        // Give this write its own longer D-Bus deadline. Other dashboard calls
+        // keep their usual timeout and stay deferred until verification ends.
+        let write_conn = tokio::time::timeout(Duration::from_secs(5),
+            zbus::connection::Builder::system()?.method_timeout(Duration::from_secs(60)).build())
+            .await.map_err(|_| zbus::Error::Failure("无法连接 oFono 系统总线".into()))??;
+        let write = async {
+            let proxy = ModemProxy::new(&write_conn).await?;
+            proxy.set_property("Online", zbus::zvariant::Value::Bool(!enabled)).await
+        };
+        crate::serial::confirm_modem_state(write, || async {
+            // Bypass snapshots: confirmation must inspect a fresh, explicit
+            // Online boolean, not an absent property's false default.
+            let proxy = Proxy::new(conn, "org.ofono", "/ril_0", "org.ofono.Modem").await?;
+            let props: Properties = proxy.call("GetProperties", &()).await?;
+            let online = props.get("Online").and_then(|v| bool::try_from(v).ok());
+            if online != Some(!enabled) { return Ok(None); }
+            let powered = props.get("Powered").and_then(|v| bool::try_from(v).ok()).unwrap_or(false);
+            Ok(Some(AirplaneModeResponse { enabled, powered, online: !enabled }))
+        }, Duration::from_secs(60), Duration::from_secs(10)).await
+    });
+    tokio::time::timeout_at(deadline, work).await.map_err(|_| zbus::Error::Failure(
+        "飞行模式切换等待超时（60 秒），设备仍可能继续处理，请稍后检查状态。".into()))?
 }
 
 /// 获取飞行模式状态
@@ -1173,8 +1328,7 @@ pub async fn set_airplane_mode(conn: &Connection, enabled: bool) -> zbus::Result
 /// 飞行模式状态判断：
 /// - enabled = !Online (Online=false 表示飞行模式已启用)
 pub async fn get_airplane_mode(conn: &Connection) -> zbus::Result<AirplaneModeResponse> {
-    let proxy = ModemProxy::new(conn).await?;
-    let props = proxy.get_properties().await?;
+    let props = snapshot_properties(conn, "org.ofono.Modem").await?;
     
     let powered = props
         .get("Powered")
@@ -1207,30 +1361,27 @@ pub async fn get_airplane_mode(conn: &Connection) -> zbus::Result<AirplaneModeRe
 /// # 说明
 /// 通过 RadioSettings.GetProperties 获取 TechnologyPreference 属性
 pub async fn get_radio_mode(conn: &Connection) -> zbus::Result<RadioModeResponse> {
-    with_serial(async {
-        let proxy = RadioSettingsProxy::new(conn).await?;
-        let props = proxy.get_properties().await?;
-        
-        let technology_preference = props
-            .get("TechnologyPreference")
-            .and_then(|v| String::try_from(v.clone()).ok())
-            .unwrap_or_else(|| "unknown".to_string());
-        
-        // 尝试映射为标准模式
-        let mode = RadioMode::from_ofono_value(&technology_preference)
-            .map(|m| match m {
-                RadioMode::Auto => "auto",
-                RadioMode::LteOnly => "lte",
-                RadioMode::NrOnly => "nr",
-            })
-            .unwrap_or("unknown")
-            .to_string();
-        
-        Ok(RadioModeResponse {
-            mode,
-            technology_preference,
+    let props = snapshot_properties(conn, "org.ofono.RadioSettings").await?;
+
+    let technology_preference = props
+        .get("TechnologyPreference")
+        .and_then(|v| String::try_from(v.clone()).ok())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // 尝试映射为标准模式
+    let mode = RadioMode::from_ofono_value(&technology_preference)
+        .map(|m| match m {
+            RadioMode::Auto => "auto",
+            RadioMode::LteOnly => "lte",
+            RadioMode::NrOnly => "nr",
         })
-    }).await
+        .unwrap_or("unknown")
+        .to_string();
+
+    Ok(RadioModeResponse {
+        mode,
+        technology_preference,
+    })
 }
 
 /// 设置射频模式
@@ -1245,7 +1396,7 @@ pub async fn get_radio_mode(conn: &Connection) -> zbus::Result<RadioModeResponse
 /// # 说明
 /// 通过 RadioSettings.SetProperty 设置 TechnologyPreference 属性
 pub async fn set_radio_mode(conn: &Connection, mode: RadioMode) -> zbus::Result<()> {
-    with_serial(async {
+    with_modem_write(async {
         let proxy = RadioSettingsProxy::new(conn).await?;
         let ofono_value = mode.to_ofono_value();
         
@@ -1417,19 +1568,19 @@ use crate::models::{
 
 /// 获取 IMEISV（软件版本号）
 pub async fn get_imeisv(conn: &Connection) -> zbus::Result<ImeisvResponse> {
-    with_serial(async {
+    let result = IMEISV_SNAPSHOT.get(&snapshot_scope(conn), Duration::from_secs(300), with_modem_read("imeisv", async {
         let proxy = Proxy::new(conn, "org.ofono", "/ril_0", "org.ofono.Modem").await?;
-        let result: HashMap<String, OwnedValue> = proxy.call("GetImeisv", &()).await?;
-        
-        let svn = result
-            .get("SoftwareVersionNumber")
-            .and_then(|v| String::try_from(v.clone()).ok())
-            .unwrap_or_else(|| "Unknown".to_string());
-        
-        Ok(ImeisvResponse {
-            software_version_number: svn,
-        })
-    }).await
+        proxy.call("GetImeisv", &()).await
+    })).await?;
+
+    let svn = result
+        .get("SoftwareVersionNumber")
+        .and_then(|v| String::try_from(v.clone()).ok())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    Ok(ImeisvResponse {
+        software_version_number: svn,
+    })
 }
 
 /// 获取信号强度详细信息
@@ -1467,31 +1618,20 @@ pub async fn get_nitz_time(conn: &Connection) -> zbus::Result<NitzTimeResponse> 
 
 /// 获取 IMS 状态
 pub async fn get_ims_status(conn: &Connection) -> zbus::Result<ImsStatusResponse> {
-    with_modem_read("ims-status", async {
-        let proxy = Proxy::new(conn, "org.ofono", "/ril_0", "org.ofono.IpMultimediaSystem").await?;
-        let props: HashMap<String, OwnedValue> = proxy.call("GetProperties", &()).await?;
-        
-        let registered = props
-            .get("Registered")
-            .and_then(|v| bool::try_from(v.clone()).ok())
-            .unwrap_or(false);
-        
-        let voice_capable = props
-            .get("VoiceCapable")
-            .and_then(|v| bool::try_from(v.clone()).ok())
-            .unwrap_or(false);
-        
-        let sms_capable = props
-            .get("SmsCapable")
-            .and_then(|v| bool::try_from(v.clone()).ok())
-            .unwrap_or(false);
-        
-        Ok(ImsStatusResponse {
-            registered,
-            voice_capable,
-            sms_capable,
-        })
-    }).await
+    let props = snapshot_properties(conn, "org.ofono.IpMultimediaSystem").await?;
+    let registered = props
+        .get("Registered")
+        .and_then(|v| bool::try_from(v.clone()).ok())
+        .unwrap_or(false);
+    let voice_capable = props
+        .get("VoiceCapable")
+        .and_then(|v| bool::try_from(v.clone()).ok())
+        .unwrap_or(false);
+    let sms_capable = props
+        .get("SmsCapable")
+        .and_then(|v| bool::try_from(v.clone()).ok())
+        .unwrap_or(false);
+    Ok(ImsStatusResponse { registered, voice_capable, sms_capable })
 }
 
 /// 获取通话音量
@@ -1583,23 +1723,24 @@ pub async fn get_voicemail_status(conn: &Connection) -> zbus::Result<VoicemailSt
 
 /// 获取运营商列表（快速，仅返回当前）
 pub async fn get_operators(conn: &Connection) -> zbus::Result<OperatorListResponse> {
-    with_serial(async {
+    let result = OPERATOR_SNAPSHOT.get(&snapshot_scope(conn), Duration::from_secs(10), with_modem_read("operators", async {
         let proxy = Proxy::new(conn, "org.ofono", "/ril_0", "org.ofono.NetworkRegistration").await?;
-        let result: Vec<(zbus::zvariant::OwnedObjectPath, HashMap<String, OwnedValue>)> = 
-            proxy.call("GetOperators", &()).await?;
-        
-        let mut operators = Vec::new();
-        for (path, props) in result {
-            operators.push(parse_operator_info(path.to_string(), props));
-        }
-        
-        Ok(OperatorListResponse { operators })
-    }).await
+        proxy.call("GetOperators", &()).await
+    })).await?;
+
+    let mut operators = Vec::new();
+    for (path, props) in result.iter() {
+        let props = props.iter().map(|(key, value)| Ok((key.clone(), value.try_clone()?)))
+            .collect::<zbus::Result<Properties>>()?;
+        operators.push(parse_operator_info(path.to_string(), props));
+    }
+
+    Ok(OperatorListResponse { operators })
 }
 
 /// 扫描运营商（慢，返回所有可用）
 pub async fn scan_operators(conn: &Connection) -> zbus::Result<OperatorListResponse> {
-    with_serial(async {
+    with_modem_write(async {
         let proxy = Proxy::new(conn, "org.ofono", "/ril_0", "org.ofono.NetworkRegistration").await?;
         let result: Vec<(zbus::zvariant::OwnedObjectPath, HashMap<String, OwnedValue>)> = 
             proxy.call("Scan", &()).await?;
@@ -1824,6 +1965,63 @@ pub async fn register_operator_auto(conn: &Connection) -> zbus::Result<()> {
     }).await
 }
 
+type AutoSelectionResult = Option<Result<(), String>>;
+type AutoSelectionReceiver = tokio::sync::watch::Receiver<AutoSelectionResult>;
+static PROFILE_AUTO_SELECTION: tokio::sync::Mutex<Option<AutoSelectionReceiver>> = tokio::sync::Mutex::const_new(None);
+
+// Coalesce overlapping profile switches: automatic selection is a global Modem
+// policy, so a pending recovery can serve the latest enabled profile as well.
+async fn start_profile_auto_selection<F>(
+    state: &tokio::sync::Mutex<Option<AutoSelectionReceiver>>,
+    work: F,
+) -> AutoSelectionReceiver
+where
+    F: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
+    let mut state = state.lock().await;
+    if let Some(receiver) = state.as_ref() {
+        if receiver.borrow().is_none() && receiver.has_changed().is_ok() {
+            return receiver.clone();
+        }
+    }
+    let (sender, receiver) = tokio::sync::watch::channel(None);
+    tokio::spawn(async move {
+        // Bound the lifetime of the Modem change guard and command lock too.
+        let result = match tokio::time::timeout(Duration::from_secs(120), work).await {
+            Ok(result) => result,
+            Err(_) => Err("Automatic selection confirmation timed out; the Modem may still be registering".into()),
+        };
+        if let Err(error) = &result {
+            warn!("Profile automatic selection remains unconfirmed (registration may still succeed): {}", error);
+        }
+        let _ = sender.send(Some(result));
+    });
+    *state = Some(receiver.clone());
+    receiver
+}
+
+async fn wait_profile_auto_selection(mut receiver: AutoSelectionReceiver, wait: Duration) -> (bool, Option<String>) {
+    // Timing out this observer does not cancel the submitted background job.
+    if receiver.borrow().is_none() {
+        let _ = tokio::time::timeout(wait, receiver.changed()).await;
+    }
+    let result = receiver.borrow().clone();
+    match result {
+        Some(Ok(())) => (false, None),
+        Some(Err(error)) => (false, Some(error)),
+        None => (true, Some("自动选网结果尚未确认，已转入后台处理；设备可能暂时返回失败或超时".into())),
+    }
+}
+
+/// Submit recovery after a confirmed profile switch, allowing at most two extra
+/// seconds in the HTTP request. Background recovery retains Modem read guards.
+pub async fn submit_profile_auto_selection(conn: Arc<Connection>) -> (bool, Option<String>) {
+    let receiver = start_profile_auto_selection(&PROFILE_AUTO_SELECTION, async move {
+        register_operator_auto(&conn).await.map_err(|error| error.to_string())
+    }).await;
+    wait_profile_auto_selection(receiver, Duration::from_secs(2)).await
+}
+
 /// 获取呼叫转移设置
 pub async fn get_call_forwarding(conn: &Connection) -> zbus::Result<CallForwardingResponse> {
     with_serial(async {
@@ -1976,28 +2174,31 @@ use crate::models::SimSlotResponse;
 
 /// 获取 SIM 卡槽信息
 pub async fn get_sim_slot(conn: &Connection) -> zbus::Result<SimSlotResponse> {
-    with_serial(async {
-        let proxy = Proxy::new(conn, "org.ofono", "/ril_0", "org.ofono.Modem").await?;
-        let response: String = proxy.call("SendAtcmd", &("AT+SPCONFIGSIMSLOT?")).await?;
-        
-        // 解析响应：+SPCONFIGSIMSLOT: 66051
-        let raw_value = response
-            .lines()
-            .find(|line| line.contains("+SPCONFIGSIMSLOT:"))
-            .and_then(|line| line.split(':').nth(1))
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| String::new());
-        
-        // 根据值判断卡槽（这个需要根据实际设备的规则来解析）
-        // 66051 可能表示卡槽 1，66306 可能表示卡槽 2
-        // 您需要提供切换命令来确认规则
-        let active_slot = if raw_value.contains("66051") { 1 } else if raw_value.contains("66306") { 2 } else { 0 };
-        
-        Ok(SimSlotResponse {
-            active_slot,
-            raw_value,
-        })
-    }).await
+    let response = SLOT_SNAPSHOT.get(&snapshot_scope(conn), Duration::from_secs(60), async {
+        let response = send_at_read_command(conn, "AT+SPCONFIGSIMSLOT?").await?;
+        if !response.lines().any(|line| line.trim() == "OK") || !response.contains("+SPCONFIGSIMSLOT:") {
+            return Err(zbus::Error::Failure(format!("Invalid SIM slot response: {}", response.trim())));
+        }
+        Ok(response)
+    }).await?;
+
+    // 解析响应：+SPCONFIGSIMSLOT: 66051
+    let raw_value = response
+        .lines()
+        .find(|line| line.contains("+SPCONFIGSIMSLOT:"))
+        .and_then(|line| line.split(':').nth(1))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| String::new());
+
+    // 根据值判断卡槽（这个需要根据实际设备的规则来解析）
+    // 66051 可能表示卡槽 1，66306 可能表示卡槽 2
+    // 您需要提供切换命令来确认规则
+    let active_slot = if raw_value.contains("66051") { 1 } else if raw_value.contains("66306") { 2 } else { 0 };
+
+    Ok(SimSlotResponse {
+        active_slot,
+        raw_value,
+    })
 }
 
 /// 切换 SIM 卡槽
@@ -2020,6 +2221,41 @@ pub async fn switch_sim_slot(conn: &Connection, slot: u8) -> zbus::Result<String
         
         Ok(response)
     }).await
+}
+
+#[cfg(test)]
+mod profile_auto_selection_tests {
+    use super::{start_profile_auto_selection, wait_profile_auto_selection};
+    use std::{sync::{Arc, atomic::{AtomicUsize, Ordering}}, time::Duration};
+
+    #[tokio::test]
+    async fn timeout_keeps_recovery_running_and_repeated_switches_share_the_job() {
+        let state = tokio::sync::Mutex::new(None);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first_calls = calls.clone();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let receiver = start_profile_auto_selection(&state, async move {
+            first_calls.fetch_add(1, Ordering::SeqCst);
+            wait.await.unwrap();
+            Ok(())
+        }).await;
+        let pending = wait_profile_auto_selection(receiver, Duration::from_millis(1)).await;
+        assert!(pending.0);
+        assert!(pending.1.unwrap().contains("后台处理"));
+        let second_calls = calls.clone();
+        let mut shared = start_profile_auto_selection(&state, async move {
+            second_calls.fetch_add(1, Ordering::SeqCst);
+            Err("A duplicate job must not run".into())
+        }).await;
+        release.send(()).unwrap();
+        shared.changed().await.unwrap();
+        assert_eq!(wait_profile_auto_selection(shared, Duration::from_secs(1)).await, (false, None));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let failed = start_profile_auto_selection(&state, async { Err("org.ofono.Error.Failed".into()) }).await;
+        assert_eq!(wait_profile_auto_selection(failed, Duration::from_secs(1)).await,
+            (false, Some("org.ofono.Error.Failed".into())));
+    }
 }
 
 #[cfg(test)]
